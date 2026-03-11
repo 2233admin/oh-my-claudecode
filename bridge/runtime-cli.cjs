@@ -3126,6 +3126,50 @@ var import_perf_hooks = require("perf_hooks");
 var import_fs11 = require("fs");
 var import_promises5 = require("fs/promises");
 var import_path14 = require("path");
+
+// src/team/governance.ts
+var DEFAULT_TEAM_TRANSPORT_POLICY = {
+  display_mode: "split_pane",
+  worker_launch_mode: "interactive",
+  dispatch_mode: "hook_preferred_with_fallback",
+  dispatch_ack_timeout_ms: 15e3
+};
+var DEFAULT_TEAM_GOVERNANCE = {
+  delegation_only: false,
+  plan_approval_required: false,
+  nested_teams_allowed: false,
+  one_team_per_leader_session: true,
+  cleanup_requires_all_workers_inactive: true
+};
+function normalizeTeamTransportPolicy(policy) {
+  return {
+    display_mode: policy?.display_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.display_mode,
+    worker_launch_mode: policy?.worker_launch_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.worker_launch_mode,
+    dispatch_mode: policy?.dispatch_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_mode,
+    dispatch_ack_timeout_ms: typeof policy?.dispatch_ack_timeout_ms === "number" ? policy.dispatch_ack_timeout_ms : DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_ack_timeout_ms
+  };
+}
+function normalizeTeamGovernance(governance, legacyPolicy) {
+  return {
+    delegation_only: governance?.delegation_only ?? legacyPolicy?.delegation_only ?? DEFAULT_TEAM_GOVERNANCE.delegation_only,
+    plan_approval_required: governance?.plan_approval_required ?? legacyPolicy?.plan_approval_required ?? DEFAULT_TEAM_GOVERNANCE.plan_approval_required,
+    nested_teams_allowed: governance?.nested_teams_allowed ?? legacyPolicy?.nested_teams_allowed ?? DEFAULT_TEAM_GOVERNANCE.nested_teams_allowed,
+    one_team_per_leader_session: governance?.one_team_per_leader_session ?? legacyPolicy?.one_team_per_leader_session ?? DEFAULT_TEAM_GOVERNANCE.one_team_per_leader_session,
+    cleanup_requires_all_workers_inactive: governance?.cleanup_requires_all_workers_inactive ?? legacyPolicy?.cleanup_requires_all_workers_inactive ?? DEFAULT_TEAM_GOVERNANCE.cleanup_requires_all_workers_inactive
+  };
+}
+function normalizeTeamManifest(manifest) {
+  return {
+    ...manifest,
+    policy: normalizeTeamTransportPolicy(manifest.policy),
+    governance: normalizeTeamGovernance(manifest.governance, manifest.policy)
+  };
+}
+function getConfigGovernance(config) {
+  return normalizeTeamGovernance(config?.governance, config?.policy);
+}
+
+// src/team/monitor.ts
 async function readJsonSafe2(filePath) {
   try {
     if (!(0, import_fs11.existsSync)(filePath)) return null;
@@ -3223,6 +3267,29 @@ async function writeWorkerInbox(teamName, workerName2, content, cwd) {
 }
 async function saveTeamConfig(config, cwd) {
   await writeAtomic(absPath(cwd, TeamPaths.config(config.name)), JSON.stringify(config, null, 2));
+  const manifestPath = absPath(cwd, TeamPaths.manifest(config.name));
+  const existingManifest = await readJsonSafe2(manifestPath);
+  if (existingManifest) {
+    const nextManifest = normalizeTeamManifest({
+      ...existingManifest,
+      workers: config.workers,
+      worker_count: config.worker_count,
+      tmux_session: config.tmux_session,
+      next_task_id: config.next_task_id,
+      created_at: config.created_at,
+      leader_cwd: config.leader_cwd,
+      team_state_root: config.team_state_root,
+      workspace_mode: config.workspace_mode,
+      leader_pane_id: config.leader_pane_id,
+      hud_pane_id: config.hud_pane_id,
+      resize_hook_name: config.resize_hook_name,
+      resize_hook_target: config.resize_hook_target,
+      next_worker_index: config.next_worker_index,
+      policy: config.policy ?? existingManifest.policy,
+      governance: config.governance ?? existingManifest.governance
+    });
+    await writeAtomic(manifestPath, JSON.stringify(nextManifest, null, 2));
+  }
 }
 async function cleanupTeamState(teamName, cwd) {
   const root = absPath(cwd, TeamPaths.root(teamName));
@@ -3833,6 +3900,8 @@ async function startTeamV2(config) {
     task: config.tasks.map((t) => t.subject).join("; "),
     agent_type: agentTypes[0] || "claude",
     worker_launch_mode: "interactive",
+    policy: DEFAULT_TEAM_TRANSPORT_POLICY,
+    governance: DEFAULT_TEAM_GOVERNANCE,
     worker_count: config.workerCount,
     max_workers: 20,
     workers: workersInfo,
@@ -3849,6 +3918,38 @@ async function startTeamV2(config) {
     ...ownsWindow ? { workspace_mode: "single" } : {}
   };
   await saveTeamConfig(teamConfig, leaderCwd);
+  const permissionsSnapshot = {
+    approval_mode: process.env.OMC_APPROVAL_MODE || "default",
+    sandbox_mode: process.env.OMC_SANDBOX_MODE || "default",
+    network_access: process.env.OMC_NETWORK_ACCESS === "1"
+  };
+  const teamManifest = {
+    schema_version: 2,
+    name: sanitized,
+    task: teamConfig.task,
+    leader: {
+      session_id: sessionName2,
+      worker_id: "leader-fixed",
+      role: "leader"
+    },
+    policy: DEFAULT_TEAM_TRANSPORT_POLICY,
+    governance: DEFAULT_TEAM_GOVERNANCE,
+    permissions_snapshot: permissionsSnapshot,
+    tmux_session: sessionName2,
+    worker_count: teamConfig.worker_count,
+    workers: workersInfo,
+    next_task_id: teamConfig.next_task_id,
+    created_at: teamConfig.created_at,
+    leader_cwd: leaderCwd,
+    team_state_root: teamConfig.team_state_root,
+    workspace_mode: teamConfig.workspace_mode,
+    leader_pane_id: leaderPaneId,
+    hud_pane_id: null,
+    resize_hook_name: null,
+    resize_hook_target: null,
+    next_worker_index: teamConfig.next_worker_index
+  };
+  await (0, import_promises7.writeFile)(absPath(leaderCwd, TeamPaths.manifest(sanitized)), JSON.stringify(teamManifest, null, 2), "utf-8");
   const maxConcurrent = Math.min(agentTypes.length, config.tasks.length);
   for (let i = 0; i < maxConcurrent; i++) {
     const wName = workerNames[i];
@@ -4029,6 +4130,7 @@ async function shutdownTeamV2(teamName, cwd, options = {}) {
   }
   if (!force) {
     const allTasks = await listTasksFromFiles(sanitized, cwd);
+    const governance = getConfigGovernance(config);
     const gate = {
       total: allTasks.length,
       pending: allTasks.filter((t) => t.status === "pending").length,
@@ -4047,7 +4149,14 @@ async function shutdownTeamV2(teamName, cwd, options = {}) {
     });
     if (!gate.allowed) {
       const hasActiveWork = gate.pending > 0 || gate.blocked > 0 || gate.in_progress > 0;
-      if (ralph && !hasActiveWork) {
+      if (!governance.cleanup_requires_all_workers_inactive) {
+        await appendTeamEvent(sanitized, {
+          type: "team_leader_nudge",
+          worker: "leader-fixed",
+          reason: `cleanup_override_bypassed:pending=${gate.pending},blocked=${gate.blocked},in_progress=${gate.in_progress},failed=${gate.failed}`
+        }, cwd).catch(() => {
+        });
+      } else if (ralph && !hasActiveWork) {
         await appendTeamEvent(sanitized, {
           type: "team_leader_nudge",
           worker: "leader-fixed",

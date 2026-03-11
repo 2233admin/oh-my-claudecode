@@ -21015,6 +21015,748 @@ var init_state_paths = __esm({
   }
 });
 
+// src/team/governance.ts
+var governance_exports = {};
+__export(governance_exports, {
+  DEFAULT_TEAM_GOVERNANCE: () => DEFAULT_TEAM_GOVERNANCE,
+  DEFAULT_TEAM_TRANSPORT_POLICY: () => DEFAULT_TEAM_TRANSPORT_POLICY,
+  getConfigGovernance: () => getConfigGovernance,
+  normalizeTeamGovernance: () => normalizeTeamGovernance,
+  normalizeTeamManifest: () => normalizeTeamManifest,
+  normalizeTeamTransportPolicy: () => normalizeTeamTransportPolicy
+});
+function normalizeTeamTransportPolicy(policy) {
+  return {
+    display_mode: policy?.display_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.display_mode,
+    worker_launch_mode: policy?.worker_launch_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.worker_launch_mode,
+    dispatch_mode: policy?.dispatch_mode ?? DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_mode,
+    dispatch_ack_timeout_ms: typeof policy?.dispatch_ack_timeout_ms === "number" ? policy.dispatch_ack_timeout_ms : DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_ack_timeout_ms
+  };
+}
+function normalizeTeamGovernance(governance, legacyPolicy) {
+  return {
+    delegation_only: governance?.delegation_only ?? legacyPolicy?.delegation_only ?? DEFAULT_TEAM_GOVERNANCE.delegation_only,
+    plan_approval_required: governance?.plan_approval_required ?? legacyPolicy?.plan_approval_required ?? DEFAULT_TEAM_GOVERNANCE.plan_approval_required,
+    nested_teams_allowed: governance?.nested_teams_allowed ?? legacyPolicy?.nested_teams_allowed ?? DEFAULT_TEAM_GOVERNANCE.nested_teams_allowed,
+    one_team_per_leader_session: governance?.one_team_per_leader_session ?? legacyPolicy?.one_team_per_leader_session ?? DEFAULT_TEAM_GOVERNANCE.one_team_per_leader_session,
+    cleanup_requires_all_workers_inactive: governance?.cleanup_requires_all_workers_inactive ?? legacyPolicy?.cleanup_requires_all_workers_inactive ?? DEFAULT_TEAM_GOVERNANCE.cleanup_requires_all_workers_inactive
+  };
+}
+function normalizeTeamManifest(manifest) {
+  return {
+    ...manifest,
+    policy: normalizeTeamTransportPolicy(manifest.policy),
+    governance: normalizeTeamGovernance(manifest.governance, manifest.policy)
+  };
+}
+function getConfigGovernance(config2) {
+  return normalizeTeamGovernance(config2?.governance, config2?.policy);
+}
+var DEFAULT_TEAM_TRANSPORT_POLICY, DEFAULT_TEAM_GOVERNANCE;
+var init_governance = __esm({
+  "src/team/governance.ts"() {
+    "use strict";
+    DEFAULT_TEAM_TRANSPORT_POLICY = {
+      display_mode: "split_pane",
+      worker_launch_mode: "interactive",
+      dispatch_mode: "hook_preferred_with_fallback",
+      dispatch_ack_timeout_ms: 15e3
+    };
+    DEFAULT_TEAM_GOVERNANCE = {
+      delegation_only: false,
+      plan_approval_required: false,
+      nested_teams_allowed: false,
+      one_team_per_leader_session: true,
+      cleanup_requires_all_workers_inactive: true
+    };
+  }
+});
+
+// src/team/state/tasks.ts
+async function computeTaskReadiness(teamName, taskId, cwd2, deps) {
+  const task = await deps.readTask(teamName, taskId, cwd2);
+  if (!task) return { ready: false, reason: "blocked_dependency", dependencies: [] };
+  const depIds = task.depends_on ?? task.blocked_by ?? [];
+  if (depIds.length === 0) return { ready: true };
+  const depTasks = await Promise.all(depIds.map((depId) => deps.readTask(teamName, depId, cwd2)));
+  const incomplete = depIds.filter((_, idx) => depTasks[idx]?.status !== "completed");
+  if (incomplete.length > 0) return { ready: false, reason: "blocked_dependency", dependencies: incomplete };
+  return { ready: true };
+}
+async function claimTask(taskId, workerName2, expectedVersion, deps) {
+  const cfg = await deps.readTeamConfig(deps.teamName, deps.cwd);
+  if (!cfg || !cfg.workers.some((w) => w.name === workerName2)) return { ok: false, error: "worker_not_found" };
+  const existing = await deps.readTask(deps.teamName, taskId, deps.cwd);
+  if (!existing) return { ok: false, error: "task_not_found" };
+  const readiness = await computeTaskReadiness(deps.teamName, taskId, deps.cwd, deps);
+  if (readiness.ready === false) {
+    return { ok: false, error: "blocked_dependency", dependencies: readiness.dependencies };
+  }
+  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
+    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
+    if (!current) return { ok: false, error: "task_not_found" };
+    const v = deps.normalizeTask(current);
+    if (expectedVersion !== null && v.version !== expectedVersion) return { ok: false, error: "claim_conflict" };
+    const readinessAfterLock = await computeTaskReadiness(deps.teamName, taskId, deps.cwd, deps);
+    if (readinessAfterLock.ready === false) {
+      return { ok: false, error: "blocked_dependency", dependencies: readinessAfterLock.dependencies };
+    }
+    if (deps.isTerminalTaskStatus(v.status)) return { ok: false, error: "already_terminal" };
+    if (v.status === "in_progress") return { ok: false, error: "claim_conflict" };
+    if (v.status === "pending" || v.status === "blocked") {
+      if (v.claim) return { ok: false, error: "claim_conflict" };
+      if (v.owner && v.owner !== workerName2) return { ok: false, error: "claim_conflict" };
+    }
+    const claimToken = (0, import_crypto13.randomUUID)();
+    const updated = {
+      ...v,
+      status: "in_progress",
+      owner: workerName2,
+      claim: { owner: workerName2, token: claimToken, leased_until: new Date(Date.now() + 15 * 60 * 1e3).toISOString() },
+      version: v.version + 1
+    };
+    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    return { ok: true, task: updated, claimToken };
+  });
+  if (!lock.ok) return { ok: false, error: "claim_conflict" };
+  return lock.value;
+}
+async function transitionTaskStatus(taskId, from, to, claimToken, deps) {
+  if (!deps.canTransitionTaskStatus(from, to)) return { ok: false, error: "invalid_transition" };
+  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
+    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
+    if (!current) return { ok: false, error: "task_not_found" };
+    const v = deps.normalizeTask(current);
+    if (deps.isTerminalTaskStatus(v.status)) return { ok: false, error: "already_terminal" };
+    if (!deps.canTransitionTaskStatus(v.status, to)) return { ok: false, error: "invalid_transition" };
+    if (v.status !== from) return { ok: false, error: "invalid_transition" };
+    if (!v.owner || !v.claim || v.claim.owner !== v.owner || v.claim.token !== claimToken) {
+      return { ok: false, error: "claim_conflict" };
+    }
+    if (new Date(v.claim.leased_until) <= /* @__PURE__ */ new Date()) return { ok: false, error: "lease_expired" };
+    const updated = {
+      ...v,
+      status: to,
+      completed_at: (/* @__PURE__ */ new Date()).toISOString(),
+      claim: void 0,
+      version: v.version + 1
+    };
+    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    if (to === "completed") {
+      await deps.appendTeamEvent(
+        deps.teamName,
+        { type: "task_completed", worker: updated.owner || "unknown", task_id: updated.id, message_id: null, reason: void 0 },
+        deps.cwd
+      );
+    } else if (to === "failed") {
+      await deps.appendTeamEvent(
+        deps.teamName,
+        { type: "task_failed", worker: updated.owner || "unknown", task_id: updated.id, message_id: null, reason: updated.error || "task_failed" },
+        deps.cwd
+      );
+    }
+    return { ok: true, task: updated };
+  });
+  if (!lock.ok) return { ok: false, error: "claim_conflict" };
+  if (to === "completed") {
+    const existing = await deps.readMonitorSnapshot(deps.teamName, deps.cwd);
+    const updated = existing ? { ...existing, completedEventTaskIds: { ...existing.completedEventTaskIds ?? {}, [taskId]: true } } : {
+      taskStatusById: {},
+      workerAliveByName: {},
+      workerStateByName: {},
+      workerTurnCountByName: {},
+      workerTaskIdByName: {},
+      mailboxNotifiedByMessageId: {},
+      completedEventTaskIds: { [taskId]: true }
+    };
+    await deps.writeMonitorSnapshot(deps.teamName, updated, deps.cwd);
+  }
+  return lock.value;
+}
+async function releaseTaskClaim(taskId, claimToken, _workerName, deps) {
+  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
+    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
+    if (!current) return { ok: false, error: "task_not_found" };
+    const v = deps.normalizeTask(current);
+    if (v.status === "pending" && !v.claim && !v.owner) return { ok: true, task: v };
+    if (v.status === "completed" || v.status === "failed") return { ok: false, error: "already_terminal" };
+    if (!v.owner || !v.claim || v.claim.owner !== v.owner || v.claim.token !== claimToken) {
+      return { ok: false, error: "claim_conflict" };
+    }
+    if (new Date(v.claim.leased_until) <= /* @__PURE__ */ new Date()) return { ok: false, error: "lease_expired" };
+    const updated = {
+      ...v,
+      status: "pending",
+      owner: void 0,
+      claim: void 0,
+      version: v.version + 1
+    };
+    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
+    return { ok: true, task: updated };
+  });
+  if (!lock.ok) return { ok: false, error: "claim_conflict" };
+  return lock.value;
+}
+async function listTasks(teamName, cwd2, deps) {
+  const tasksRoot = (0, import_path86.join)(deps.teamDir(teamName, cwd2), "tasks");
+  if (!(0, import_fs75.existsSync)(tasksRoot)) return [];
+  const entries = await (0, import_promises6.readdir)(tasksRoot, { withFileTypes: true });
+  const matched = entries.flatMap((entry) => {
+    if (!entry.isFile()) return [];
+    const match = /^(?:task-)?(\d+)\.json$/.exec(entry.name);
+    if (!match) return [];
+    return [{ id: match[1], fileName: entry.name }];
+  });
+  const loaded = await Promise.all(
+    matched.map(async ({ id, fileName }) => {
+      try {
+        const raw = await (0, import_promises6.readFile)((0, import_path86.join)(tasksRoot, fileName), "utf8");
+        const parsed = JSON.parse(raw);
+        if (!deps.isTeamTask(parsed)) return null;
+        const normalized = deps.normalizeTask(parsed);
+        if (normalized.id !== id) return null;
+        return normalized;
+      } catch {
+        return null;
+      }
+    })
+  );
+  const tasks = [];
+  for (const task of loaded) {
+    if (task) tasks.push(task);
+  }
+  tasks.sort((a, b) => Number(a.id) - Number(b.id));
+  return tasks;
+}
+var import_crypto13, import_path86, import_fs75, import_promises6;
+var init_tasks = __esm({
+  "src/team/state/tasks.ts"() {
+    "use strict";
+    import_crypto13 = require("crypto");
+    import_path86 = require("path");
+    import_fs75 = require("fs");
+    import_promises6 = require("fs/promises");
+  }
+});
+
+// src/team/team-ops.ts
+var team_ops_exports = {};
+__export(team_ops_exports, {
+  teamAppendEvent: () => teamAppendEvent,
+  teamBroadcast: () => teamBroadcast,
+  teamClaimTask: () => teamClaimTask,
+  teamCleanup: () => teamCleanup,
+  teamCreateTask: () => teamCreateTask,
+  teamGetSummary: () => teamGetSummary,
+  teamListMailbox: () => teamListMailbox,
+  teamListTasks: () => teamListTasks,
+  teamMarkMessageDelivered: () => teamMarkMessageDelivered,
+  teamMarkMessageNotified: () => teamMarkMessageNotified,
+  teamReadConfig: () => teamReadConfig,
+  teamReadManifest: () => teamReadManifest,
+  teamReadMonitorSnapshot: () => teamReadMonitorSnapshot,
+  teamReadShutdownAck: () => teamReadShutdownAck,
+  teamReadTask: () => teamReadTask,
+  teamReadTaskApproval: () => teamReadTaskApproval,
+  teamReadWorkerHeartbeat: () => teamReadWorkerHeartbeat,
+  teamReadWorkerStatus: () => teamReadWorkerStatus,
+  teamReleaseTaskClaim: () => teamReleaseTaskClaim,
+  teamSendMessage: () => teamSendMessage,
+  teamTransitionTaskStatus: () => teamTransitionTaskStatus,
+  teamUpdateTask: () => teamUpdateTask,
+  teamUpdateWorkerHeartbeat: () => teamUpdateWorkerHeartbeat,
+  teamWriteMonitorSnapshot: () => teamWriteMonitorSnapshot,
+  teamWriteShutdownRequest: () => teamWriteShutdownRequest,
+  teamWriteTaskApproval: () => teamWriteTaskApproval,
+  teamWriteWorkerIdentity: () => teamWriteWorkerIdentity,
+  teamWriteWorkerInbox: () => teamWriteWorkerInbox,
+  writeAtomic: () => writeAtomic
+});
+function teamDir2(teamName, cwd2) {
+  return absPath(cwd2, TeamPaths.root(teamName));
+}
+function normalizeTaskId(taskId) {
+  const raw = String(taskId).trim();
+  return raw.startsWith("task-") ? raw.slice("task-".length) : raw;
+}
+function canonicalTaskFilePath(teamName, taskId, cwd2) {
+  const normalizedTaskId = normalizeTaskId(taskId);
+  return (0, import_node_path5.join)(absPath(cwd2, TeamPaths.tasks(teamName)), `task-${normalizedTaskId}.json`);
+}
+function legacyTaskFilePath(teamName, taskId, cwd2) {
+  const normalizedTaskId = normalizeTaskId(taskId);
+  return (0, import_node_path5.join)(absPath(cwd2, TeamPaths.tasks(teamName)), `${normalizedTaskId}.json`);
+}
+function taskFileCandidates(teamName, taskId, cwd2) {
+  const canonical = canonicalTaskFilePath(teamName, taskId, cwd2);
+  const legacy = legacyTaskFilePath(teamName, taskId, cwd2);
+  return canonical === legacy ? [canonical] : [canonical, legacy];
+}
+async function writeAtomic(path20, data) {
+  const tmp = `${path20}.${process.pid}.tmp`;
+  await (0, import_promises7.mkdir)((0, import_node_path5.dirname)(path20), { recursive: true });
+  await (0, import_promises7.writeFile)(tmp, data, "utf8");
+  const { rename: rename3 } = await import("node:fs/promises");
+  await rename3(tmp, path20);
+}
+async function readJsonSafe(path20) {
+  try {
+    if (!(0, import_node_fs2.existsSync)(path20)) return null;
+    const raw = await (0, import_promises7.readFile)(path20, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+function normalizeTask(task) {
+  return { ...task, version: task.version ?? 1 };
+}
+function isTeamTask(value) {
+  if (!value || typeof value !== "object") return false;
+  const v = value;
+  return typeof v.id === "string" && typeof v.subject === "string" && typeof v.status === "string";
+}
+async function withLock(lockDir, fn) {
+  const STALE_MS = 3e4;
+  try {
+    await (0, import_promises7.mkdir)(lockDir, { recursive: false });
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      try {
+        const { stat: stat2 } = await import("node:fs/promises");
+        const s = await stat2(lockDir);
+        if (Date.now() - s.mtimeMs > STALE_MS) {
+          await (0, import_promises7.rm)(lockDir, { recursive: true, force: true });
+          try {
+            await (0, import_promises7.mkdir)(lockDir, { recursive: false });
+          } catch {
+            return { ok: false };
+          }
+        } else {
+          return { ok: false };
+        }
+      } catch {
+        return { ok: false };
+      }
+    } else {
+      throw err;
+    }
+  }
+  try {
+    const result = await fn();
+    return { ok: true, value: result };
+  } finally {
+    await (0, import_promises7.rm)(lockDir, { recursive: true, force: true }).catch(() => {
+    });
+  }
+}
+async function withTaskClaimLock(teamName, taskId, cwd2, fn) {
+  const lockDir = (0, import_node_path5.join)(teamDir2(teamName, cwd2), "tasks", `.lock-${taskId}`);
+  return withLock(lockDir, fn);
+}
+async function withMailboxLock(teamName, workerName2, cwd2, fn) {
+  const lockDir = absPath(cwd2, TeamPaths.mailboxLockDir(teamName, workerName2));
+  const timeoutMs = 5e3;
+  const deadline = Date.now() + timeoutMs;
+  let delayMs = 20;
+  while (Date.now() < deadline) {
+    const result = await withLock(lockDir, fn);
+    if (result.ok) return result.value;
+    await new Promise((resolve11) => setTimeout(resolve11, delayMs));
+    delayMs = Math.min(delayMs * 2, 200);
+  }
+  throw new Error(`Failed to acquire mailbox lock for ${workerName2} after ${timeoutMs}ms`);
+}
+async function teamReadConfig(teamName, cwd2) {
+  const manifest = await teamReadManifest(teamName, cwd2);
+  if (manifest) {
+    return {
+      name: manifest.name,
+      task: manifest.task,
+      agent_type: "claude",
+      policy: manifest.policy,
+      governance: manifest.governance,
+      worker_launch_mode: manifest.policy.worker_launch_mode,
+      worker_count: manifest.worker_count,
+      max_workers: 20,
+      workers: manifest.workers,
+      created_at: manifest.created_at,
+      tmux_session: manifest.tmux_session,
+      next_task_id: manifest.next_task_id,
+      leader_cwd: manifest.leader_cwd,
+      team_state_root: manifest.team_state_root,
+      workspace_mode: manifest.workspace_mode,
+      leader_pane_id: manifest.leader_pane_id,
+      hud_pane_id: manifest.hud_pane_id,
+      resize_hook_name: manifest.resize_hook_name,
+      resize_hook_target: manifest.resize_hook_target,
+      next_worker_index: manifest.next_worker_index
+    };
+  }
+  const configPath = absPath(cwd2, TeamPaths.config(teamName));
+  return readJsonSafe(configPath);
+}
+async function teamReadManifest(teamName, cwd2) {
+  const manifestPath = absPath(cwd2, TeamPaths.manifest(teamName));
+  const manifest = await readJsonSafe(manifestPath);
+  return manifest ? normalizeTeamManifest(manifest) : null;
+}
+async function teamCleanup(teamName, cwd2) {
+  await (0, import_promises7.rm)(teamDir2(teamName, cwd2), { recursive: true, force: true });
+}
+async function teamWriteWorkerIdentity(teamName, workerName2, identity, cwd2) {
+  const p = absPath(cwd2, TeamPaths.workerIdentity(teamName, workerName2));
+  await writeAtomic(p, JSON.stringify(identity, null, 2));
+}
+async function teamReadWorkerHeartbeat(teamName, workerName2, cwd2) {
+  const p = absPath(cwd2, TeamPaths.heartbeat(teamName, workerName2));
+  return readJsonSafe(p);
+}
+async function teamUpdateWorkerHeartbeat(teamName, workerName2, heartbeat, cwd2) {
+  const p = absPath(cwd2, TeamPaths.heartbeat(teamName, workerName2));
+  await writeAtomic(p, JSON.stringify(heartbeat, null, 2));
+}
+async function teamReadWorkerStatus(teamName, workerName2, cwd2) {
+  const unknownStatus = { state: "unknown", updated_at: "1970-01-01T00:00:00.000Z" };
+  const p = absPath(cwd2, TeamPaths.workerStatus(teamName, workerName2));
+  const status = await readJsonSafe(p);
+  return status ?? unknownStatus;
+}
+async function teamWriteWorkerInbox(teamName, workerName2, prompt, cwd2) {
+  const p = absPath(cwd2, TeamPaths.inbox(teamName, workerName2));
+  await writeAtomic(p, prompt);
+}
+async function teamCreateTask(teamName, task, cwd2) {
+  const cfg = await teamReadConfig(teamName, cwd2);
+  if (!cfg) throw new Error(`Team ${teamName} not found`);
+  const nextId = String(cfg.next_task_id ?? 1);
+  const created = {
+    ...task,
+    id: nextId,
+    status: task.status ?? "pending",
+    depends_on: task.depends_on ?? task.blocked_by ?? [],
+    version: 1,
+    created_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const taskPath2 = absPath(cwd2, TeamPaths.tasks(teamName));
+  await (0, import_promises7.mkdir)(taskPath2, { recursive: true });
+  await writeAtomic((0, import_node_path5.join)(taskPath2, `task-${nextId}.json`), JSON.stringify(created, null, 2));
+  cfg.next_task_id = Number(nextId) + 1;
+  await writeAtomic(absPath(cwd2, TeamPaths.config(teamName)), JSON.stringify(cfg, null, 2));
+  return created;
+}
+async function teamReadTask(teamName, taskId, cwd2) {
+  for (const candidate of taskFileCandidates(teamName, taskId, cwd2)) {
+    const task = await readJsonSafe(candidate);
+    if (!task || !isTeamTask(task)) continue;
+    return normalizeTask(task);
+  }
+  return null;
+}
+async function teamListTasks(teamName, cwd2) {
+  return listTasks(teamName, cwd2, {
+    teamDir: (tn, c) => teamDir2(tn, c),
+    isTeamTask,
+    normalizeTask
+  });
+}
+async function teamUpdateTask(teamName, taskId, updates, cwd2) {
+  const existing = await teamReadTask(teamName, taskId, cwd2);
+  if (!existing) return null;
+  const merged = {
+    ...normalizeTask(existing),
+    ...updates,
+    id: existing.id,
+    created_at: existing.created_at,
+    version: Math.max(1, existing.version ?? 1) + 1
+  };
+  const p = canonicalTaskFilePath(teamName, taskId, cwd2);
+  await writeAtomic(p, JSON.stringify(merged, null, 2));
+  return merged;
+}
+async function teamClaimTask(teamName, taskId, workerName2, expectedVersion, cwd2) {
+  const manifest = await teamReadManifest(teamName, cwd2);
+  const governance = normalizeTeamGovernance(manifest?.governance, manifest?.policy);
+  if (governance.plan_approval_required) {
+    const task = await teamReadTask(teamName, taskId, cwd2);
+    if (task?.requires_code_change) {
+      const approval = await teamReadTaskApproval(teamName, taskId, cwd2);
+      if (!approval || approval.status !== "approved") {
+        return { ok: false, error: "blocked_dependency", dependencies: ["approval-required"] };
+      }
+    }
+  }
+  return claimTask(taskId, workerName2, expectedVersion, {
+    teamName,
+    cwd: cwd2,
+    readTask: teamReadTask,
+    readTeamConfig: teamReadConfig,
+    withTaskClaimLock,
+    normalizeTask,
+    isTerminalTaskStatus: isTerminalTeamTaskStatus,
+    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
+    writeAtomic
+  });
+}
+async function teamTransitionTaskStatus(teamName, taskId, from, to, claimToken, cwd2) {
+  return transitionTaskStatus(taskId, from, to, claimToken, {
+    teamName,
+    cwd: cwd2,
+    readTask: teamReadTask,
+    readTeamConfig: teamReadConfig,
+    withTaskClaimLock,
+    normalizeTask,
+    isTerminalTaskStatus: isTerminalTeamTaskStatus,
+    canTransitionTaskStatus: canTransitionTeamTaskStatus,
+    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
+    writeAtomic,
+    appendTeamEvent: teamAppendEvent,
+    readMonitorSnapshot: teamReadMonitorSnapshot,
+    writeMonitorSnapshot: teamWriteMonitorSnapshot
+  });
+}
+async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerName2, cwd2) {
+  return releaseTaskClaim(taskId, claimToken, workerName2, {
+    teamName,
+    cwd: cwd2,
+    readTask: teamReadTask,
+    readTeamConfig: teamReadConfig,
+    withTaskClaimLock,
+    normalizeTask,
+    isTerminalTaskStatus: isTerminalTeamTaskStatus,
+    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
+    writeAtomic
+  });
+}
+function normalizeLegacyMailboxMessage(raw) {
+  if (raw.type === "notified") return null;
+  const messageId = typeof raw.message_id === "string" && raw.message_id.trim() !== "" ? raw.message_id : typeof raw.id === "string" && raw.id.trim() !== "" ? raw.id : "";
+  const fromWorker = typeof raw.from_worker === "string" && raw.from_worker.trim() !== "" ? raw.from_worker : typeof raw.from === "string" ? raw.from : "";
+  const toWorker = typeof raw.to_worker === "string" && raw.to_worker.trim() !== "" ? raw.to_worker : typeof raw.to === "string" ? raw.to : "";
+  const body = typeof raw.body === "string" ? raw.body : "";
+  const createdAt = typeof raw.created_at === "string" && raw.created_at.trim() !== "" ? raw.created_at : typeof raw.createdAt === "string" ? raw.createdAt : "";
+  if (!messageId || !fromWorker || !toWorker || !body || !createdAt) return null;
+  return {
+    message_id: messageId,
+    from_worker: fromWorker,
+    to_worker: toWorker,
+    body,
+    created_at: createdAt,
+    ...typeof raw.notified_at === "string" ? { notified_at: raw.notified_at } : {},
+    ...typeof raw.notifiedAt === "string" ? { notified_at: raw.notifiedAt } : {},
+    ...typeof raw.delivered_at === "string" ? { delivered_at: raw.delivered_at } : {},
+    ...typeof raw.deliveredAt === "string" ? { delivered_at: raw.deliveredAt } : {}
+  };
+}
+async function readLegacyMailboxJsonl(teamName, workerName2, cwd2) {
+  const legacyPath = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2).replace(/\.json$/i, ".jsonl"));
+  if (!(0, import_node_fs2.existsSync)(legacyPath)) return { worker: workerName2, messages: [] };
+  try {
+    const raw = await (0, import_promises7.readFile)(legacyPath, "utf8");
+    const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
+    const byMessageId = /* @__PURE__ */ new Map();
+    for (const line of lines) {
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!parsed || typeof parsed !== "object") continue;
+      const normalized = normalizeLegacyMailboxMessage(parsed);
+      if (!normalized) continue;
+      byMessageId.set(normalized.message_id, normalized);
+    }
+    return { worker: workerName2, messages: [...byMessageId.values()] };
+  } catch {
+    return { worker: workerName2, messages: [] };
+  }
+}
+async function readMailbox(teamName, workerName2, cwd2) {
+  const p = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2));
+  const mailbox = await readJsonSafe(p);
+  if (mailbox && Array.isArray(mailbox.messages)) {
+    return { worker: workerName2, messages: mailbox.messages };
+  }
+  return readLegacyMailboxJsonl(teamName, workerName2, cwd2);
+}
+async function writeMailbox(teamName, workerName2, mailbox, cwd2) {
+  const p = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2));
+  await writeAtomic(p, JSON.stringify(mailbox, null, 2));
+}
+async function teamSendMessage(teamName, fromWorker, toWorker, body, cwd2) {
+  return withMailboxLock(teamName, toWorker, cwd2, async () => {
+    const mailbox = await readMailbox(teamName, toWorker, cwd2);
+    const message = {
+      message_id: (0, import_node_crypto.randomUUID)(),
+      from_worker: fromWorker,
+      to_worker: toWorker,
+      body,
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    mailbox.messages.push(message);
+    await writeMailbox(teamName, toWorker, mailbox, cwd2);
+    await teamAppendEvent(teamName, {
+      type: "message_received",
+      worker: toWorker,
+      message_id: message.message_id
+    }, cwd2);
+    return message;
+  });
+}
+async function teamBroadcast(teamName, fromWorker, body, cwd2) {
+  const cfg = await teamReadConfig(teamName, cwd2);
+  if (!cfg) throw new Error(`Team ${teamName} not found`);
+  const messages = [];
+  for (const worker of cfg.workers) {
+    if (worker.name === fromWorker) continue;
+    const msg = await teamSendMessage(teamName, fromWorker, worker.name, body, cwd2);
+    messages.push(msg);
+  }
+  return messages;
+}
+async function teamListMailbox(teamName, workerName2, cwd2) {
+  const mailbox = await readMailbox(teamName, workerName2, cwd2);
+  return mailbox.messages;
+}
+async function teamMarkMessageDelivered(teamName, workerName2, messageId, cwd2) {
+  return withMailboxLock(teamName, workerName2, cwd2, async () => {
+    const mailbox = await readMailbox(teamName, workerName2, cwd2);
+    const msg = mailbox.messages.find((m) => m.message_id === messageId);
+    if (!msg) return false;
+    msg.delivered_at = (/* @__PURE__ */ new Date()).toISOString();
+    await writeMailbox(teamName, workerName2, mailbox, cwd2);
+    return true;
+  });
+}
+async function teamMarkMessageNotified(teamName, workerName2, messageId, cwd2) {
+  return withMailboxLock(teamName, workerName2, cwd2, async () => {
+    const mailbox = await readMailbox(teamName, workerName2, cwd2);
+    const msg = mailbox.messages.find((m) => m.message_id === messageId);
+    if (!msg) return false;
+    msg.notified_at = (/* @__PURE__ */ new Date()).toISOString();
+    await writeMailbox(teamName, workerName2, mailbox, cwd2);
+    return true;
+  });
+}
+async function teamAppendEvent(teamName, event, cwd2) {
+  const full = {
+    event_id: (0, import_node_crypto.randomUUID)(),
+    team: teamName,
+    created_at: (/* @__PURE__ */ new Date()).toISOString(),
+    ...event
+  };
+  const p = absPath(cwd2, TeamPaths.events(teamName));
+  await (0, import_promises7.mkdir)((0, import_node_path5.dirname)(p), { recursive: true });
+  await (0, import_promises7.appendFile)(p, `${JSON.stringify(full)}
+`, "utf8");
+  return full;
+}
+async function teamReadTaskApproval(teamName, taskId, cwd2) {
+  const p = absPath(cwd2, TeamPaths.approval(teamName, taskId));
+  return readJsonSafe(p);
+}
+async function teamWriteTaskApproval(teamName, approval, cwd2) {
+  const p = absPath(cwd2, TeamPaths.approval(teamName, approval.task_id));
+  await writeAtomic(p, JSON.stringify(approval, null, 2));
+  await teamAppendEvent(teamName, {
+    type: "approval_decision",
+    worker: approval.reviewer,
+    task_id: approval.task_id,
+    reason: `${approval.status}: ${approval.decision_reason}`
+  }, cwd2);
+}
+async function teamGetSummary(teamName, cwd2) {
+  const startMs = Date.now();
+  const cfg = await teamReadConfig(teamName, cwd2);
+  if (!cfg) return null;
+  const tasksStartMs = Date.now();
+  const tasks = await teamListTasks(teamName, cwd2);
+  const tasksLoadedMs = Date.now() - tasksStartMs;
+  const counts = {
+    total: tasks.length,
+    pending: 0,
+    blocked: 0,
+    in_progress: 0,
+    completed: 0,
+    failed: 0
+  };
+  for (const t of tasks) {
+    if (t.status in counts) counts[t.status]++;
+  }
+  const workersStartMs = Date.now();
+  const workerEntries = [];
+  const nonReporting = [];
+  for (const w of cfg.workers) {
+    const hb = await teamReadWorkerHeartbeat(teamName, w.name, cwd2);
+    if (!hb) {
+      nonReporting.push(w.name);
+      workerEntries.push({ name: w.name, alive: false, lastTurnAt: null, turnsWithoutProgress: 0 });
+    } else {
+      workerEntries.push({
+        name: w.name,
+        alive: hb.alive,
+        lastTurnAt: hb.last_turn_at,
+        turnsWithoutProgress: 0
+      });
+    }
+  }
+  const workersPollMs = Date.now() - workersStartMs;
+  const performance3 = {
+    total_ms: Date.now() - startMs,
+    tasks_loaded_ms: tasksLoadedMs,
+    workers_polled_ms: workersPollMs,
+    task_count: tasks.length,
+    worker_count: cfg.workers.length
+  };
+  return {
+    teamName,
+    workerCount: cfg.workers.length,
+    tasks: counts,
+    workers: workerEntries,
+    nonReportingWorkers: nonReporting,
+    performance: performance3
+  };
+}
+async function teamWriteShutdownRequest(teamName, workerName2, requestedBy, cwd2) {
+  const p = absPath(cwd2, TeamPaths.shutdownRequest(teamName, workerName2));
+  await writeAtomic(p, JSON.stringify({ requested_at: (/* @__PURE__ */ new Date()).toISOString(), requested_by: requestedBy }, null, 2));
+}
+async function teamReadShutdownAck(teamName, workerName2, cwd2, minUpdatedAt) {
+  const ackPath = absPath(cwd2, TeamPaths.shutdownAck(teamName, workerName2));
+  const parsed = await readJsonSafe(ackPath);
+  if (!parsed || parsed.status !== "accept" && parsed.status !== "reject") return null;
+  if (typeof minUpdatedAt === "string" && minUpdatedAt.trim() !== "") {
+    const minTs = Date.parse(minUpdatedAt);
+    const ackTs = Date.parse(parsed.updated_at ?? "");
+    if (!Number.isFinite(minTs) || !Number.isFinite(ackTs) || ackTs < minTs) return null;
+  }
+  return parsed;
+}
+async function teamReadMonitorSnapshot(teamName, cwd2) {
+  const p = absPath(cwd2, TeamPaths.monitorSnapshot(teamName));
+  return readJsonSafe(p);
+}
+async function teamWriteMonitorSnapshot(teamName, snapshot, cwd2) {
+  const p = absPath(cwd2, TeamPaths.monitorSnapshot(teamName));
+  await writeAtomic(p, JSON.stringify(snapshot, null, 2));
+}
+var import_node_crypto, import_node_fs2, import_promises7, import_node_path5;
+var init_team_ops = __esm({
+  "src/team/team-ops.ts"() {
+    "use strict";
+    import_node_crypto = require("node:crypto");
+    import_node_fs2 = require("node:fs");
+    import_promises7 = require("node:fs/promises");
+    import_node_path5 = require("node:path");
+    init_state_paths();
+    init_governance();
+    init_governance();
+    init_contracts();
+    init_tasks();
+  }
+});
+
 // src/team/fs-utils.ts
 function atomicWriteJson2(filePath, data, mode = 384) {
   const dir = (0, import_path87.dirname)(filePath);
@@ -22683,6 +23425,29 @@ async function writeWorkerInbox(teamName, workerName2, content, cwd2) {
 }
 async function saveTeamConfig(config2, cwd2) {
   await writeAtomic2(absPath(cwd2, TeamPaths.config(config2.name)), JSON.stringify(config2, null, 2));
+  const manifestPath = absPath(cwd2, TeamPaths.manifest(config2.name));
+  const existingManifest = await readJsonSafe2(manifestPath);
+  if (existingManifest) {
+    const nextManifest = normalizeTeamManifest({
+      ...existingManifest,
+      workers: config2.workers,
+      worker_count: config2.worker_count,
+      tmux_session: config2.tmux_session,
+      next_task_id: config2.next_task_id,
+      created_at: config2.created_at,
+      leader_cwd: config2.leader_cwd,
+      team_state_root: config2.team_state_root,
+      workspace_mode: config2.workspace_mode,
+      leader_pane_id: config2.leader_pane_id,
+      hud_pane_id: config2.hud_pane_id,
+      resize_hook_name: config2.resize_hook_name,
+      resize_hook_target: config2.resize_hook_target,
+      next_worker_index: config2.next_worker_index,
+      policy: config2.policy ?? existingManifest.policy,
+      governance: config2.governance ?? existingManifest.governance
+    });
+    await writeAtomic2(manifestPath, JSON.stringify(nextManifest, null, 2));
+  }
 }
 async function cleanupTeamState(teamName, cwd2) {
   const root2 = absPath(cwd2, TeamPaths.root(teamName));
@@ -22700,6 +23465,7 @@ var init_monitor = __esm({
     import_promises11 = require("fs/promises");
     import_path92 = require("path");
     init_state_paths();
+    init_governance();
   }
 });
 
@@ -23104,6 +23870,8 @@ async function startTeamV2(config2) {
     task: config2.tasks.map((t) => t.subject).join("; "),
     agent_type: agentTypes[0] || "claude",
     worker_launch_mode: "interactive",
+    policy: DEFAULT_TEAM_TRANSPORT_POLICY,
+    governance: DEFAULT_TEAM_GOVERNANCE,
     worker_count: config2.workerCount,
     max_workers: 20,
     workers: workersInfo,
@@ -23120,6 +23888,38 @@ async function startTeamV2(config2) {
     ...ownsWindow ? { workspace_mode: "single" } : {}
   };
   await saveTeamConfig(teamConfig, leaderCwd);
+  const permissionsSnapshot = {
+    approval_mode: process.env.OMC_APPROVAL_MODE || "default",
+    sandbox_mode: process.env.OMC_SANDBOX_MODE || "default",
+    network_access: process.env.OMC_NETWORK_ACCESS === "1"
+  };
+  const teamManifest = {
+    schema_version: 2,
+    name: sanitized,
+    task: teamConfig.task,
+    leader: {
+      session_id: sessionName2,
+      worker_id: "leader-fixed",
+      role: "leader"
+    },
+    policy: DEFAULT_TEAM_TRANSPORT_POLICY,
+    governance: DEFAULT_TEAM_GOVERNANCE,
+    permissions_snapshot: permissionsSnapshot,
+    tmux_session: sessionName2,
+    worker_count: teamConfig.worker_count,
+    workers: workersInfo,
+    next_task_id: teamConfig.next_task_id,
+    created_at: teamConfig.created_at,
+    leader_cwd: leaderCwd,
+    team_state_root: teamConfig.team_state_root,
+    workspace_mode: teamConfig.workspace_mode,
+    leader_pane_id: leaderPaneId,
+    hud_pane_id: null,
+    resize_hook_name: null,
+    resize_hook_target: null,
+    next_worker_index: teamConfig.next_worker_index
+  };
+  await (0, import_promises13.writeFile)(absPath(leaderCwd, TeamPaths.manifest(sanitized)), JSON.stringify(teamManifest, null, 2), "utf-8");
   const maxConcurrent = Math.min(agentTypes.length, config2.tasks.length);
   for (let i = 0; i < maxConcurrent; i++) {
     const wName = workerNames[i];
@@ -23351,6 +24151,7 @@ async function shutdownTeamV2(teamName, cwd2, options = {}) {
   }
   if (!force) {
     const allTasks = await listTasksFromFiles(sanitized, cwd2);
+    const governance = getConfigGovernance(config2);
     const gate = {
       total: allTasks.length,
       pending: allTasks.filter((t) => t.status === "pending").length,
@@ -23369,7 +24170,14 @@ async function shutdownTeamV2(teamName, cwd2, options = {}) {
     });
     if (!gate.allowed) {
       const hasActiveWork = gate.pending > 0 || gate.blocked > 0 || gate.in_progress > 0;
-      if (ralph && !hasActiveWork) {
+      if (!governance.cleanup_requires_all_workers_inactive) {
+        await appendTeamEvent(sanitized, {
+          type: "team_leader_nudge",
+          worker: "leader-fixed",
+          reason: `cleanup_override_bypassed:pending=${gate.pending},blocked=${gate.blocked},in_progress=${gate.in_progress},failed=${gate.failed}`
+        }, cwd2).catch(() => {
+        });
+      } else if (ralph && !hasActiveWork) {
         await appendTeamEvent(sanitized, {
           type: "team_leader_nudge",
           worker: "leader-fixed",
@@ -23525,6 +24333,7 @@ var init_runtime_v2 = __esm({
     init_state_paths();
     init_monitor();
     init_events();
+    init_governance();
     init_phase_controller();
     init_team_name();
     init_model_contract();
@@ -62835,634 +63644,7 @@ async function doctorConflictsCommand(options) {
 var import_node_fs3 = require("node:fs");
 var import_node_path6 = require("node:path");
 init_contracts();
-
-// src/team/team-ops.ts
-var import_node_crypto = require("node:crypto");
-var import_node_fs2 = require("node:fs");
-var import_promises7 = require("node:fs/promises");
-var import_node_path5 = require("node:path");
-init_state_paths();
-init_contracts();
-
-// src/team/state/tasks.ts
-var import_crypto13 = require("crypto");
-var import_path86 = require("path");
-var import_fs75 = require("fs");
-var import_promises6 = require("fs/promises");
-async function computeTaskReadiness(teamName, taskId, cwd2, deps) {
-  const task = await deps.readTask(teamName, taskId, cwd2);
-  if (!task) return { ready: false, reason: "blocked_dependency", dependencies: [] };
-  const depIds = task.depends_on ?? task.blocked_by ?? [];
-  if (depIds.length === 0) return { ready: true };
-  const depTasks = await Promise.all(depIds.map((depId) => deps.readTask(teamName, depId, cwd2)));
-  const incomplete = depIds.filter((_, idx) => depTasks[idx]?.status !== "completed");
-  if (incomplete.length > 0) return { ready: false, reason: "blocked_dependency", dependencies: incomplete };
-  return { ready: true };
-}
-async function claimTask(taskId, workerName2, expectedVersion, deps) {
-  const cfg = await deps.readTeamConfig(deps.teamName, deps.cwd);
-  if (!cfg || !cfg.workers.some((w) => w.name === workerName2)) return { ok: false, error: "worker_not_found" };
-  const existing = await deps.readTask(deps.teamName, taskId, deps.cwd);
-  if (!existing) return { ok: false, error: "task_not_found" };
-  const readiness = await computeTaskReadiness(deps.teamName, taskId, deps.cwd, deps);
-  if (readiness.ready === false) {
-    return { ok: false, error: "blocked_dependency", dependencies: readiness.dependencies };
-  }
-  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
-    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
-    if (!current) return { ok: false, error: "task_not_found" };
-    const v = deps.normalizeTask(current);
-    if (expectedVersion !== null && v.version !== expectedVersion) return { ok: false, error: "claim_conflict" };
-    const readinessAfterLock = await computeTaskReadiness(deps.teamName, taskId, deps.cwd, deps);
-    if (readinessAfterLock.ready === false) {
-      return { ok: false, error: "blocked_dependency", dependencies: readinessAfterLock.dependencies };
-    }
-    if (deps.isTerminalTaskStatus(v.status)) return { ok: false, error: "already_terminal" };
-    if (v.status === "in_progress") return { ok: false, error: "claim_conflict" };
-    if (v.status === "pending" || v.status === "blocked") {
-      if (v.claim) return { ok: false, error: "claim_conflict" };
-      if (v.owner && v.owner !== workerName2) return { ok: false, error: "claim_conflict" };
-    }
-    const claimToken = (0, import_crypto13.randomUUID)();
-    const updated = {
-      ...v,
-      status: "in_progress",
-      owner: workerName2,
-      claim: { owner: workerName2, token: claimToken, leased_until: new Date(Date.now() + 15 * 60 * 1e3).toISOString() },
-      version: v.version + 1
-    };
-    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
-    return { ok: true, task: updated, claimToken };
-  });
-  if (!lock.ok) return { ok: false, error: "claim_conflict" };
-  return lock.value;
-}
-async function transitionTaskStatus(taskId, from, to, claimToken, deps) {
-  if (!deps.canTransitionTaskStatus(from, to)) return { ok: false, error: "invalid_transition" };
-  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
-    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
-    if (!current) return { ok: false, error: "task_not_found" };
-    const v = deps.normalizeTask(current);
-    if (deps.isTerminalTaskStatus(v.status)) return { ok: false, error: "already_terminal" };
-    if (!deps.canTransitionTaskStatus(v.status, to)) return { ok: false, error: "invalid_transition" };
-    if (v.status !== from) return { ok: false, error: "invalid_transition" };
-    if (!v.owner || !v.claim || v.claim.owner !== v.owner || v.claim.token !== claimToken) {
-      return { ok: false, error: "claim_conflict" };
-    }
-    if (new Date(v.claim.leased_until) <= /* @__PURE__ */ new Date()) return { ok: false, error: "lease_expired" };
-    const updated = {
-      ...v,
-      status: to,
-      completed_at: (/* @__PURE__ */ new Date()).toISOString(),
-      claim: void 0,
-      version: v.version + 1
-    };
-    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
-    if (to === "completed") {
-      await deps.appendTeamEvent(
-        deps.teamName,
-        { type: "task_completed", worker: updated.owner || "unknown", task_id: updated.id, message_id: null, reason: void 0 },
-        deps.cwd
-      );
-    } else if (to === "failed") {
-      await deps.appendTeamEvent(
-        deps.teamName,
-        { type: "task_failed", worker: updated.owner || "unknown", task_id: updated.id, message_id: null, reason: updated.error || "task_failed" },
-        deps.cwd
-      );
-    }
-    return { ok: true, task: updated };
-  });
-  if (!lock.ok) return { ok: false, error: "claim_conflict" };
-  if (to === "completed") {
-    const existing = await deps.readMonitorSnapshot(deps.teamName, deps.cwd);
-    const updated = existing ? { ...existing, completedEventTaskIds: { ...existing.completedEventTaskIds ?? {}, [taskId]: true } } : {
-      taskStatusById: {},
-      workerAliveByName: {},
-      workerStateByName: {},
-      workerTurnCountByName: {},
-      workerTaskIdByName: {},
-      mailboxNotifiedByMessageId: {},
-      completedEventTaskIds: { [taskId]: true }
-    };
-    await deps.writeMonitorSnapshot(deps.teamName, updated, deps.cwd);
-  }
-  return lock.value;
-}
-async function releaseTaskClaim(taskId, claimToken, _workerName, deps) {
-  const lock = await deps.withTaskClaimLock(deps.teamName, taskId, deps.cwd, async () => {
-    const current = await deps.readTask(deps.teamName, taskId, deps.cwd);
-    if (!current) return { ok: false, error: "task_not_found" };
-    const v = deps.normalizeTask(current);
-    if (v.status === "pending" && !v.claim && !v.owner) return { ok: true, task: v };
-    if (v.status === "completed" || v.status === "failed") return { ok: false, error: "already_terminal" };
-    if (!v.owner || !v.claim || v.claim.owner !== v.owner || v.claim.token !== claimToken) {
-      return { ok: false, error: "claim_conflict" };
-    }
-    if (new Date(v.claim.leased_until) <= /* @__PURE__ */ new Date()) return { ok: false, error: "lease_expired" };
-    const updated = {
-      ...v,
-      status: "pending",
-      owner: void 0,
-      claim: void 0,
-      version: v.version + 1
-    };
-    await deps.writeAtomic(deps.taskFilePath(deps.teamName, taskId, deps.cwd), JSON.stringify(updated, null, 2));
-    return { ok: true, task: updated };
-  });
-  if (!lock.ok) return { ok: false, error: "claim_conflict" };
-  return lock.value;
-}
-async function listTasks(teamName, cwd2, deps) {
-  const tasksRoot = (0, import_path86.join)(deps.teamDir(teamName, cwd2), "tasks");
-  if (!(0, import_fs75.existsSync)(tasksRoot)) return [];
-  const entries = await (0, import_promises6.readdir)(tasksRoot, { withFileTypes: true });
-  const matched = entries.flatMap((entry) => {
-    if (!entry.isFile()) return [];
-    const match = /^(?:task-)?(\d+)\.json$/.exec(entry.name);
-    if (!match) return [];
-    return [{ id: match[1], fileName: entry.name }];
-  });
-  const loaded = await Promise.all(
-    matched.map(async ({ id, fileName }) => {
-      try {
-        const raw = await (0, import_promises6.readFile)((0, import_path86.join)(tasksRoot, fileName), "utf8");
-        const parsed = JSON.parse(raw);
-        if (!deps.isTeamTask(parsed)) return null;
-        const normalized = deps.normalizeTask(parsed);
-        if (normalized.id !== id) return null;
-        return normalized;
-      } catch {
-        return null;
-      }
-    })
-  );
-  const tasks = [];
-  for (const task of loaded) {
-    if (task) tasks.push(task);
-  }
-  tasks.sort((a, b) => Number(a.id) - Number(b.id));
-  return tasks;
-}
-
-// src/team/team-ops.ts
-function teamDir2(teamName, cwd2) {
-  return absPath(cwd2, TeamPaths.root(teamName));
-}
-function normalizeTaskId(taskId) {
-  const raw = String(taskId).trim();
-  return raw.startsWith("task-") ? raw.slice("task-".length) : raw;
-}
-function canonicalTaskFilePath(teamName, taskId, cwd2) {
-  const normalizedTaskId = normalizeTaskId(taskId);
-  return (0, import_node_path5.join)(absPath(cwd2, TeamPaths.tasks(teamName)), `task-${normalizedTaskId}.json`);
-}
-function legacyTaskFilePath(teamName, taskId, cwd2) {
-  const normalizedTaskId = normalizeTaskId(taskId);
-  return (0, import_node_path5.join)(absPath(cwd2, TeamPaths.tasks(teamName)), `${normalizedTaskId}.json`);
-}
-function taskFileCandidates(teamName, taskId, cwd2) {
-  const canonical = canonicalTaskFilePath(teamName, taskId, cwd2);
-  const legacy = legacyTaskFilePath(teamName, taskId, cwd2);
-  return canonical === legacy ? [canonical] : [canonical, legacy];
-}
-async function writeAtomic(path20, data) {
-  const tmp = `${path20}.${process.pid}.tmp`;
-  await (0, import_promises7.mkdir)((0, import_node_path5.dirname)(path20), { recursive: true });
-  await (0, import_promises7.writeFile)(tmp, data, "utf8");
-  const { rename: rename3 } = await import("node:fs/promises");
-  await rename3(tmp, path20);
-}
-async function readJsonSafe(path20) {
-  try {
-    if (!(0, import_node_fs2.existsSync)(path20)) return null;
-    const raw = await (0, import_promises7.readFile)(path20, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-function normalizeTask(task) {
-  return { ...task, version: task.version ?? 1 };
-}
-function isTeamTask(value) {
-  if (!value || typeof value !== "object") return false;
-  const v = value;
-  return typeof v.id === "string" && typeof v.subject === "string" && typeof v.status === "string";
-}
-async function withLock(lockDir, fn) {
-  const STALE_MS = 3e4;
-  try {
-    await (0, import_promises7.mkdir)(lockDir, { recursive: false });
-  } catch (err) {
-    if (err.code === "EEXIST") {
-      try {
-        const { stat: stat2 } = await import("node:fs/promises");
-        const s = await stat2(lockDir);
-        if (Date.now() - s.mtimeMs > STALE_MS) {
-          await (0, import_promises7.rm)(lockDir, { recursive: true, force: true });
-          try {
-            await (0, import_promises7.mkdir)(lockDir, { recursive: false });
-          } catch {
-            return { ok: false };
-          }
-        } else {
-          return { ok: false };
-        }
-      } catch {
-        return { ok: false };
-      }
-    } else {
-      throw err;
-    }
-  }
-  try {
-    const result = await fn();
-    return { ok: true, value: result };
-  } finally {
-    await (0, import_promises7.rm)(lockDir, { recursive: true, force: true }).catch(() => {
-    });
-  }
-}
-async function withTaskClaimLock(teamName, taskId, cwd2, fn) {
-  const lockDir = (0, import_node_path5.join)(teamDir2(teamName, cwd2), "tasks", `.lock-${taskId}`);
-  return withLock(lockDir, fn);
-}
-async function withMailboxLock(teamName, workerName2, cwd2, fn) {
-  const lockDir = absPath(cwd2, TeamPaths.mailboxLockDir(teamName, workerName2));
-  const timeoutMs = 5e3;
-  const deadline = Date.now() + timeoutMs;
-  let delayMs = 20;
-  while (Date.now() < deadline) {
-    const result = await withLock(lockDir, fn);
-    if (result.ok) return result.value;
-    await new Promise((resolve11) => setTimeout(resolve11, delayMs));
-    delayMs = Math.min(delayMs * 2, 200);
-  }
-  throw new Error(`Failed to acquire mailbox lock for ${workerName2} after ${timeoutMs}ms`);
-}
-async function teamReadConfig(teamName, cwd2) {
-  const manifest = await teamReadManifest(teamName, cwd2);
-  if (manifest) {
-    return {
-      name: manifest.name,
-      task: manifest.task,
-      agent_type: "claude",
-      worker_launch_mode: manifest.policy.worker_launch_mode,
-      worker_count: manifest.worker_count,
-      max_workers: 20,
-      workers: manifest.workers,
-      created_at: manifest.created_at,
-      tmux_session: manifest.tmux_session,
-      next_task_id: manifest.next_task_id,
-      leader_cwd: manifest.leader_cwd,
-      team_state_root: manifest.team_state_root,
-      workspace_mode: manifest.workspace_mode,
-      leader_pane_id: manifest.leader_pane_id,
-      hud_pane_id: manifest.hud_pane_id,
-      resize_hook_name: manifest.resize_hook_name,
-      resize_hook_target: manifest.resize_hook_target,
-      next_worker_index: manifest.next_worker_index
-    };
-  }
-  const configPath = absPath(cwd2, TeamPaths.config(teamName));
-  return readJsonSafe(configPath);
-}
-async function teamReadManifest(teamName, cwd2) {
-  const manifestPath = absPath(cwd2, TeamPaths.manifest(teamName));
-  return readJsonSafe(manifestPath);
-}
-async function teamCleanup(teamName, cwd2) {
-  await (0, import_promises7.rm)(teamDir2(teamName, cwd2), { recursive: true, force: true });
-}
-async function teamWriteWorkerIdentity(teamName, workerName2, identity, cwd2) {
-  const p = absPath(cwd2, TeamPaths.workerIdentity(teamName, workerName2));
-  await writeAtomic(p, JSON.stringify(identity, null, 2));
-}
-async function teamReadWorkerHeartbeat(teamName, workerName2, cwd2) {
-  const p = absPath(cwd2, TeamPaths.heartbeat(teamName, workerName2));
-  return readJsonSafe(p);
-}
-async function teamUpdateWorkerHeartbeat(teamName, workerName2, heartbeat, cwd2) {
-  const p = absPath(cwd2, TeamPaths.heartbeat(teamName, workerName2));
-  await writeAtomic(p, JSON.stringify(heartbeat, null, 2));
-}
-async function teamReadWorkerStatus(teamName, workerName2, cwd2) {
-  const unknownStatus = { state: "unknown", updated_at: "1970-01-01T00:00:00.000Z" };
-  const p = absPath(cwd2, TeamPaths.workerStatus(teamName, workerName2));
-  const status = await readJsonSafe(p);
-  return status ?? unknownStatus;
-}
-async function teamWriteWorkerInbox(teamName, workerName2, prompt, cwd2) {
-  const p = absPath(cwd2, TeamPaths.inbox(teamName, workerName2));
-  await writeAtomic(p, prompt);
-}
-async function teamCreateTask(teamName, task, cwd2) {
-  const cfg = await teamReadConfig(teamName, cwd2);
-  if (!cfg) throw new Error(`Team ${teamName} not found`);
-  const nextId = String(cfg.next_task_id ?? 1);
-  const created = {
-    ...task,
-    id: nextId,
-    status: task.status ?? "pending",
-    depends_on: task.depends_on ?? task.blocked_by ?? [],
-    version: 1,
-    created_at: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  const taskPath2 = absPath(cwd2, TeamPaths.tasks(teamName));
-  await (0, import_promises7.mkdir)(taskPath2, { recursive: true });
-  await writeAtomic((0, import_node_path5.join)(taskPath2, `task-${nextId}.json`), JSON.stringify(created, null, 2));
-  cfg.next_task_id = Number(nextId) + 1;
-  await writeAtomic(absPath(cwd2, TeamPaths.config(teamName)), JSON.stringify(cfg, null, 2));
-  return created;
-}
-async function teamReadTask(teamName, taskId, cwd2) {
-  for (const candidate of taskFileCandidates(teamName, taskId, cwd2)) {
-    const task = await readJsonSafe(candidate);
-    if (!task || !isTeamTask(task)) continue;
-    return normalizeTask(task);
-  }
-  return null;
-}
-async function teamListTasks(teamName, cwd2) {
-  return listTasks(teamName, cwd2, {
-    teamDir: (tn, c) => teamDir2(tn, c),
-    isTeamTask,
-    normalizeTask
-  });
-}
-async function teamUpdateTask(teamName, taskId, updates, cwd2) {
-  const existing = await teamReadTask(teamName, taskId, cwd2);
-  if (!existing) return null;
-  const merged = {
-    ...normalizeTask(existing),
-    ...updates,
-    id: existing.id,
-    created_at: existing.created_at,
-    version: Math.max(1, existing.version ?? 1) + 1
-  };
-  const p = canonicalTaskFilePath(teamName, taskId, cwd2);
-  await writeAtomic(p, JSON.stringify(merged, null, 2));
-  return merged;
-}
-async function teamClaimTask(teamName, taskId, workerName2, expectedVersion, cwd2) {
-  return claimTask(taskId, workerName2, expectedVersion, {
-    teamName,
-    cwd: cwd2,
-    readTask: teamReadTask,
-    readTeamConfig: teamReadConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic
-  });
-}
-async function teamTransitionTaskStatus(teamName, taskId, from, to, claimToken, cwd2) {
-  return transitionTaskStatus(taskId, from, to, claimToken, {
-    teamName,
-    cwd: cwd2,
-    readTask: teamReadTask,
-    readTeamConfig: teamReadConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    canTransitionTaskStatus: canTransitionTeamTaskStatus,
-    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic,
-    appendTeamEvent: teamAppendEvent,
-    readMonitorSnapshot: teamReadMonitorSnapshot,
-    writeMonitorSnapshot: teamWriteMonitorSnapshot
-  });
-}
-async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerName2, cwd2) {
-  return releaseTaskClaim(taskId, claimToken, workerName2, {
-    teamName,
-    cwd: cwd2,
-    readTask: teamReadTask,
-    readTeamConfig: teamReadConfig,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic
-  });
-}
-function normalizeLegacyMailboxMessage(raw) {
-  if (raw.type === "notified") return null;
-  const messageId = typeof raw.message_id === "string" && raw.message_id.trim() !== "" ? raw.message_id : typeof raw.id === "string" && raw.id.trim() !== "" ? raw.id : "";
-  const fromWorker = typeof raw.from_worker === "string" && raw.from_worker.trim() !== "" ? raw.from_worker : typeof raw.from === "string" ? raw.from : "";
-  const toWorker = typeof raw.to_worker === "string" && raw.to_worker.trim() !== "" ? raw.to_worker : typeof raw.to === "string" ? raw.to : "";
-  const body = typeof raw.body === "string" ? raw.body : "";
-  const createdAt = typeof raw.created_at === "string" && raw.created_at.trim() !== "" ? raw.created_at : typeof raw.createdAt === "string" ? raw.createdAt : "";
-  if (!messageId || !fromWorker || !toWorker || !body || !createdAt) return null;
-  return {
-    message_id: messageId,
-    from_worker: fromWorker,
-    to_worker: toWorker,
-    body,
-    created_at: createdAt,
-    ...typeof raw.notified_at === "string" ? { notified_at: raw.notified_at } : {},
-    ...typeof raw.notifiedAt === "string" ? { notified_at: raw.notifiedAt } : {},
-    ...typeof raw.delivered_at === "string" ? { delivered_at: raw.delivered_at } : {},
-    ...typeof raw.deliveredAt === "string" ? { delivered_at: raw.deliveredAt } : {}
-  };
-}
-async function readLegacyMailboxJsonl(teamName, workerName2, cwd2) {
-  const legacyPath = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2).replace(/\.json$/i, ".jsonl"));
-  if (!(0, import_node_fs2.existsSync)(legacyPath)) return { worker: workerName2, messages: [] };
-  try {
-    const raw = await (0, import_promises7.readFile)(legacyPath, "utf8");
-    const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
-    const byMessageId = /* @__PURE__ */ new Map();
-    for (const line of lines) {
-      let parsed;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (!parsed || typeof parsed !== "object") continue;
-      const normalized = normalizeLegacyMailboxMessage(parsed);
-      if (!normalized) continue;
-      byMessageId.set(normalized.message_id, normalized);
-    }
-    return { worker: workerName2, messages: [...byMessageId.values()] };
-  } catch {
-    return { worker: workerName2, messages: [] };
-  }
-}
-async function readMailbox(teamName, workerName2, cwd2) {
-  const p = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2));
-  const mailbox = await readJsonSafe(p);
-  if (mailbox && Array.isArray(mailbox.messages)) {
-    return { worker: workerName2, messages: mailbox.messages };
-  }
-  return readLegacyMailboxJsonl(teamName, workerName2, cwd2);
-}
-async function writeMailbox(teamName, workerName2, mailbox, cwd2) {
-  const p = absPath(cwd2, TeamPaths.mailbox(teamName, workerName2));
-  await writeAtomic(p, JSON.stringify(mailbox, null, 2));
-}
-async function teamSendMessage(teamName, fromWorker, toWorker, body, cwd2) {
-  return withMailboxLock(teamName, toWorker, cwd2, async () => {
-    const mailbox = await readMailbox(teamName, toWorker, cwd2);
-    const message = {
-      message_id: (0, import_node_crypto.randomUUID)(),
-      from_worker: fromWorker,
-      to_worker: toWorker,
-      body,
-      created_at: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    mailbox.messages.push(message);
-    await writeMailbox(teamName, toWorker, mailbox, cwd2);
-    await teamAppendEvent(teamName, {
-      type: "message_received",
-      worker: toWorker,
-      message_id: message.message_id
-    }, cwd2);
-    return message;
-  });
-}
-async function teamBroadcast(teamName, fromWorker, body, cwd2) {
-  const cfg = await teamReadConfig(teamName, cwd2);
-  if (!cfg) throw new Error(`Team ${teamName} not found`);
-  const messages = [];
-  for (const worker of cfg.workers) {
-    if (worker.name === fromWorker) continue;
-    const msg = await teamSendMessage(teamName, fromWorker, worker.name, body, cwd2);
-    messages.push(msg);
-  }
-  return messages;
-}
-async function teamListMailbox(teamName, workerName2, cwd2) {
-  const mailbox = await readMailbox(teamName, workerName2, cwd2);
-  return mailbox.messages;
-}
-async function teamMarkMessageDelivered(teamName, workerName2, messageId, cwd2) {
-  return withMailboxLock(teamName, workerName2, cwd2, async () => {
-    const mailbox = await readMailbox(teamName, workerName2, cwd2);
-    const msg = mailbox.messages.find((m) => m.message_id === messageId);
-    if (!msg) return false;
-    msg.delivered_at = (/* @__PURE__ */ new Date()).toISOString();
-    await writeMailbox(teamName, workerName2, mailbox, cwd2);
-    return true;
-  });
-}
-async function teamMarkMessageNotified(teamName, workerName2, messageId, cwd2) {
-  return withMailboxLock(teamName, workerName2, cwd2, async () => {
-    const mailbox = await readMailbox(teamName, workerName2, cwd2);
-    const msg = mailbox.messages.find((m) => m.message_id === messageId);
-    if (!msg) return false;
-    msg.notified_at = (/* @__PURE__ */ new Date()).toISOString();
-    await writeMailbox(teamName, workerName2, mailbox, cwd2);
-    return true;
-  });
-}
-async function teamAppendEvent(teamName, event, cwd2) {
-  const full = {
-    event_id: (0, import_node_crypto.randomUUID)(),
-    team: teamName,
-    created_at: (/* @__PURE__ */ new Date()).toISOString(),
-    ...event
-  };
-  const p = absPath(cwd2, TeamPaths.events(teamName));
-  await (0, import_promises7.mkdir)((0, import_node_path5.dirname)(p), { recursive: true });
-  await (0, import_promises7.appendFile)(p, `${JSON.stringify(full)}
-`, "utf8");
-  return full;
-}
-async function teamReadTaskApproval(teamName, taskId, cwd2) {
-  const p = absPath(cwd2, TeamPaths.approval(teamName, taskId));
-  return readJsonSafe(p);
-}
-async function teamWriteTaskApproval(teamName, approval, cwd2) {
-  const p = absPath(cwd2, TeamPaths.approval(teamName, approval.task_id));
-  await writeAtomic(p, JSON.stringify(approval, null, 2));
-  await teamAppendEvent(teamName, {
-    type: "approval_decision",
-    worker: approval.reviewer,
-    task_id: approval.task_id,
-    reason: `${approval.status}: ${approval.decision_reason}`
-  }, cwd2);
-}
-async function teamGetSummary(teamName, cwd2) {
-  const startMs = Date.now();
-  const cfg = await teamReadConfig(teamName, cwd2);
-  if (!cfg) return null;
-  const tasksStartMs = Date.now();
-  const tasks = await teamListTasks(teamName, cwd2);
-  const tasksLoadedMs = Date.now() - tasksStartMs;
-  const counts = {
-    total: tasks.length,
-    pending: 0,
-    blocked: 0,
-    in_progress: 0,
-    completed: 0,
-    failed: 0
-  };
-  for (const t of tasks) {
-    if (t.status in counts) counts[t.status]++;
-  }
-  const workersStartMs = Date.now();
-  const workerEntries = [];
-  const nonReporting = [];
-  for (const w of cfg.workers) {
-    const hb = await teamReadWorkerHeartbeat(teamName, w.name, cwd2);
-    if (!hb) {
-      nonReporting.push(w.name);
-      workerEntries.push({ name: w.name, alive: false, lastTurnAt: null, turnsWithoutProgress: 0 });
-    } else {
-      workerEntries.push({
-        name: w.name,
-        alive: hb.alive,
-        lastTurnAt: hb.last_turn_at,
-        turnsWithoutProgress: 0
-      });
-    }
-  }
-  const workersPollMs = Date.now() - workersStartMs;
-  const performance3 = {
-    total_ms: Date.now() - startMs,
-    tasks_loaded_ms: tasksLoadedMs,
-    workers_polled_ms: workersPollMs,
-    task_count: tasks.length,
-    worker_count: cfg.workers.length
-  };
-  return {
-    teamName,
-    workerCount: cfg.workers.length,
-    tasks: counts,
-    workers: workerEntries,
-    nonReportingWorkers: nonReporting,
-    performance: performance3
-  };
-}
-async function teamWriteShutdownRequest(teamName, workerName2, requestedBy, cwd2) {
-  const p = absPath(cwd2, TeamPaths.shutdownRequest(teamName, workerName2));
-  await writeAtomic(p, JSON.stringify({ requested_at: (/* @__PURE__ */ new Date()).toISOString(), requested_by: requestedBy }, null, 2));
-}
-async function teamReadShutdownAck(teamName, workerName2, cwd2, minUpdatedAt) {
-  const ackPath = absPath(cwd2, TeamPaths.shutdownAck(teamName, workerName2));
-  const parsed = await readJsonSafe(ackPath);
-  if (!parsed || parsed.status !== "accept" && parsed.status !== "reject") return null;
-  if (typeof minUpdatedAt === "string" && minUpdatedAt.trim() !== "") {
-    const minTs = Date.parse(minUpdatedAt);
-    const ackTs = Date.parse(parsed.updated_at ?? "");
-    if (!Number.isFinite(minTs) || !Number.isFinite(ackTs) || ackTs < minTs) return null;
-  }
-  return parsed;
-}
-async function teamReadMonitorSnapshot(teamName, cwd2) {
-  const p = absPath(cwd2, TeamPaths.monitorSnapshot(teamName));
-  return readJsonSafe(p);
-}
-async function teamWriteMonitorSnapshot(teamName, snapshot, cwd2) {
-  const p = absPath(cwd2, TeamPaths.monitorSnapshot(teamName));
-  await writeAtomic(p, JSON.stringify(snapshot, null, 2));
-}
-
-// src/team/api-interop.ts
+init_team_ops();
 init_mcp_comm();
 init_tmux_session();
 init_dispatch_queue();
@@ -64221,12 +64403,37 @@ function getTeamWorkerIdentityFromEnv(env2 = process.env) {
   const omx = typeof env2.OMX_TEAM_WORKER === "string" ? env2.OMX_TEAM_WORKER.trim() : "";
   return omx || null;
 }
-function assertTeamSpawnAllowed(env2 = process.env) {
+async function assertTeamSpawnAllowed(cwd2, env2 = process.env) {
   const workerIdentity = getTeamWorkerIdentityFromEnv(env2);
-  if (!workerIdentity) return;
-  throw new Error(
-    `Worker context (${workerIdentity}) cannot start/spawn new teams. Use only "omc team api ..." operations from worker sessions.`
-  );
+  const { teamReadManifest: teamReadManifest2 } = await Promise.resolve().then(() => (init_team_ops(), team_ops_exports));
+  const { findActiveTeamsV2: findActiveTeamsV22 } = await Promise.resolve().then(() => (init_runtime_v2(), runtime_v2_exports));
+  const { DEFAULT_TEAM_GOVERNANCE: DEFAULT_TEAM_GOVERNANCE2, normalizeTeamGovernance: normalizeTeamGovernance2 } = await Promise.resolve().then(() => (init_governance(), governance_exports));
+  if (workerIdentity) {
+    const [parentTeamName] = workerIdentity.split("/");
+    const parentManifest = parentTeamName ? await teamReadManifest2(parentTeamName, cwd2) : null;
+    const governance = normalizeTeamGovernance2(parentManifest?.governance, parentManifest?.policy);
+    if (!governance.nested_teams_allowed) {
+      throw new Error(
+        `Worker context (${workerIdentity}) cannot start nested teams because nested_teams_allowed is false.`
+      );
+    }
+    if (!governance.delegation_only) {
+      throw new Error(
+        `Worker context (${workerIdentity}) cannot start nested teams because delegation_only is false.`
+      );
+    }
+    return;
+  }
+  const activeTeams = await findActiveTeamsV22(cwd2);
+  for (const activeTeam of activeTeams) {
+    const manifest = await teamReadManifest2(activeTeam, cwd2);
+    const governance = normalizeTeamGovernance2(manifest?.governance, manifest?.policy);
+    if (governance.one_team_per_leader_session ?? DEFAULT_TEAM_GOVERNANCE2.one_team_per_leader_session) {
+      throw new Error(
+        `Leader session already owns active team "${activeTeam}" and one_team_per_leader_session is enabled.`
+      );
+    }
+  }
 }
 var SINGLE_SPEC_RE = /^(\d+)(?::([a-z][a-z0-9-]*)(?::([a-z][a-z0-9-]*))?)?$/i;
 function parseTeamArgs(tokens) {
@@ -64445,7 +64652,7 @@ Supported operations: ${TEAM_API_OPERATIONS.join(", ")}`);
   return { operation, input, json };
 }
 async function handleTeamStart(parsed, cwd2) {
-  assertTeamSpawnAllowed();
+  await assertTeamSpawnAllowed(cwd2);
   const tasks = [];
   for (let i = 0; i < parsed.workerCount; i++) {
     tasks.push({
