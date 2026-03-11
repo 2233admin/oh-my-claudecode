@@ -1970,9 +1970,119 @@ async function shutdownTeam(teamName, sessionName2, cwd, timeoutMs = 3e4, worker
   }
 }
 
-// src/hooks/factcheck/checks.ts
-var import_fs7 = require("fs");
+// src/team/events.ts
+var import_crypto = require("crypto");
 var import_path11 = require("path");
+var import_promises4 = require("fs/promises");
+var import_fs7 = require("fs");
+async function appendTeamEvent(teamName, event, cwd) {
+  const full = {
+    event_id: (0, import_crypto.randomUUID)(),
+    team: teamName,
+    created_at: (/* @__PURE__ */ new Date()).toISOString(),
+    ...event
+  };
+  const p = absPath(cwd, TeamPaths.events(teamName));
+  await (0, import_promises4.mkdir)((0, import_path11.dirname)(p), { recursive: true });
+  await (0, import_promises4.appendFile)(p, `${JSON.stringify(full)}
+`, "utf8");
+  return full;
+}
+async function emitMonitorDerivedEvents(teamName, tasks, workers, previousSnapshot, cwd) {
+  if (!previousSnapshot) return;
+  const completedEventTaskIds = { ...previousSnapshot.completedEventTaskIds ?? {} };
+  for (const task of tasks) {
+    const prevStatus = previousSnapshot.taskStatusById?.[task.id];
+    if (!prevStatus || prevStatus === task.status) continue;
+    if (task.status === "completed" && !completedEventTaskIds[task.id]) {
+      await appendTeamEvent(teamName, {
+        type: "task_completed",
+        worker: "leader-fixed",
+        task_id: task.id,
+        reason: `status_transition:${prevStatus}->${task.status}`
+      }, cwd).catch(() => {
+      });
+      completedEventTaskIds[task.id] = true;
+    } else if (task.status === "failed") {
+      await appendTeamEvent(teamName, {
+        type: "task_failed",
+        worker: "leader-fixed",
+        task_id: task.id,
+        reason: `status_transition:${prevStatus}->${task.status}`
+      }, cwd).catch(() => {
+      });
+    }
+  }
+  for (const worker of workers) {
+    const prevAlive = previousSnapshot.workerAliveByName?.[worker.name];
+    const prevState = previousSnapshot.workerStateByName?.[worker.name];
+    if (prevAlive === true && !worker.alive) {
+      await appendTeamEvent(teamName, {
+        type: "worker_stopped",
+        worker: worker.name,
+        reason: "pane_exited"
+      }, cwd).catch(() => {
+      });
+    }
+    if (prevState === "working" && worker.status.state === "idle") {
+      await appendTeamEvent(teamName, {
+        type: "worker_idle",
+        worker: worker.name,
+        reason: `state_transition:${prevState}->${worker.status.state}`
+      }, cwd).catch(() => {
+      });
+    }
+  }
+}
+
+// src/team/leader-nudge-guidance.ts
+function activeTaskCount(input) {
+  return input.tasks.pending + input.tasks.blocked + input.tasks.inProgress;
+}
+function deriveTeamLeaderGuidance(input) {
+  const activeTasks = activeTaskCount(input);
+  const totalWorkers = Math.max(0, input.workers.total);
+  const aliveWorkers = Math.max(0, input.workers.alive);
+  const idleWorkers = Math.max(0, input.workers.idle);
+  const nonReportingWorkers = Math.max(0, input.workers.nonReporting);
+  if (activeTasks === 0) {
+    return {
+      nextAction: "shutdown",
+      reason: `all_tasks_terminal:completed=${input.tasks.completed},failed=${input.tasks.failed},workers=${totalWorkers}`,
+      message: "All tasks are in a terminal state. Review any failures, then shut down or clean up the current team."
+    };
+  }
+  if (aliveWorkers === 0) {
+    return {
+      nextAction: "launch-new-team",
+      reason: `no_alive_workers:active=${activeTasks},total_workers=${totalWorkers}`,
+      message: "Active tasks remain, but no workers appear alive. Launch a new team or replace the dead workers."
+    };
+  }
+  if (idleWorkers >= aliveWorkers) {
+    return {
+      nextAction: "reuse-current-team",
+      reason: `all_alive_workers_idle:active=${activeTasks},alive=${aliveWorkers},idle=${idleWorkers}`,
+      message: "Workers are idle while active tasks remain. Reuse the current team and reassign, unblock, or restart the pending work."
+    };
+  }
+  if (nonReportingWorkers >= aliveWorkers) {
+    return {
+      nextAction: "launch-new-team",
+      reason: `all_alive_workers_non_reporting:active=${activeTasks},alive=${aliveWorkers},non_reporting=${nonReportingWorkers}`,
+      message: "Workers are still marked alive, but none are reporting progress. Launch a replacement team or restart the stuck workers."
+    };
+  }
+  return {
+    nextAction: "keep-checking-status",
+    reason: `workers_still_active:active=${activeTasks},alive=${aliveWorkers},idle=${idleWorkers},non_reporting=${nonReportingWorkers}`,
+    message: "Workers still appear active. Keep checking team status before intervening."
+  };
+}
+
+// src/hooks/factcheck/checks.ts
+var import_fs8 = require("fs");
+var import_path12 = require("path");
 
 // src/hooks/factcheck/types.ts
 var REQUIRED_FIELDS = /* @__PURE__ */ new Set([
@@ -2054,7 +2164,7 @@ function checkPaths(claims, policy) {
         }
       }
     }
-    if (!(0, import_fs7.existsSync)(pathStr)) {
+    if (!(0, import_fs8.existsSync)(pathStr)) {
       out.push({ check: "C", severity: "FAIL", detail: `File not found: ${pathStr}` });
     }
   }
@@ -2081,8 +2191,8 @@ function checkCommands(claims, policy) {
 function checkCwdParity(claimsCwd, runtimeCwd, mode, policy) {
   const enforceCwd = policy.warn_on_cwd_mismatch && (mode !== "quick" || policy.enforce_cwd_parity_in_quick);
   if (!enforceCwd || !claimsCwd) return null;
-  const claimsCwdCanonical = (0, import_path11.resolve)(claimsCwd);
-  const runtimeCwdCanonical = (0, import_path11.resolve)(runtimeCwd);
+  const claimsCwdCanonical = (0, import_path12.resolve)(claimsCwd);
+  const runtimeCwdCanonical = (0, import_path12.resolve)(runtimeCwd);
   if (claimsCwdCanonical !== runtimeCwdCanonical) {
     const severity = mode === "strict" ? "FAIL" : "WARN";
     return {
@@ -2098,8 +2208,8 @@ function checkCwdParity(claimsCwd, runtimeCwd, mode, policy) {
 var import_os2 = require("os");
 
 // src/config/loader.ts
-var import_fs8 = require("fs");
-var import_path12 = require("path");
+var import_fs9 = require("fs");
+var import_path13 = require("path");
 
 // src/utils/jsonc.ts
 function parseJsonc(content) {
@@ -2440,16 +2550,16 @@ var DEFAULT_CONFIG = {
 function getConfigPaths() {
   const userConfigDir = getConfigDir2();
   return {
-    user: (0, import_path12.join)(userConfigDir, "claude-omc", "config.jsonc"),
-    project: (0, import_path12.join)(process.cwd(), ".claude", "omc.jsonc")
+    user: (0, import_path13.join)(userConfigDir, "claude-omc", "config.jsonc"),
+    project: (0, import_path13.join)(process.cwd(), ".claude", "omc.jsonc")
   };
 }
 function loadJsoncFile(path) {
-  if (!(0, import_fs8.existsSync)(path)) {
+  if (!(0, import_fs9.existsSync)(path)) {
     return null;
   }
   try {
-    const content = (0, import_fs8.readFileSync)(path, "utf-8");
+    const content = (0, import_fs9.readFileSync)(path, "utf-8");
     const result = parseJsonc(content);
     return result;
   } catch (error) {
@@ -2782,7 +2892,7 @@ function runFactcheck(claims, options) {
 }
 
 // src/hooks/factcheck/sentinel.ts
-var import_fs9 = require("fs");
+var import_fs10 = require("fs");
 function computeRate(numerator, denominator) {
   if (denominator === 0) return 0;
   return numerator / denominator;
@@ -2823,12 +2933,12 @@ function analyzeLog(logPath) {
     timeout_count: 0,
     reason_coverage_count: 0
   };
-  if (!(0, import_fs9.existsSync)(logPath)) {
+  if (!(0, import_fs10.existsSync)(logPath)) {
     return stats;
   }
   let content;
   try {
-    content = (0, import_fs9.readFileSync)(logPath, "utf-8");
+    content = (0, import_fs10.readFileSync)(logPath, "utf-8");
   } catch {
     return stats;
   }
@@ -3013,13 +3123,13 @@ var import_promises7 = require("fs/promises");
 var import_perf_hooks = require("perf_hooks");
 
 // src/team/monitor.ts
-var import_fs10 = require("fs");
-var import_promises4 = require("fs/promises");
-var import_path13 = require("path");
+var import_fs11 = require("fs");
+var import_promises5 = require("fs/promises");
+var import_path14 = require("path");
 async function readJsonSafe2(filePath) {
   try {
-    if (!(0, import_fs10.existsSync)(filePath)) return null;
-    const raw = await (0, import_promises4.readFile)(filePath, "utf-8");
+    if (!(0, import_fs11.existsSync)(filePath)) return null;
+    const raw = await (0, import_promises5.readFile)(filePath, "utf-8");
     return JSON.parse(raw);
   } catch {
     return null;
@@ -3027,7 +3137,7 @@ async function readJsonSafe2(filePath) {
 }
 async function writeAtomic(filePath, data) {
   const { writeFile: writeFile6 } = await import("fs/promises");
-  await (0, import_promises4.mkdir)((0, import_path13.dirname)(filePath), { recursive: true });
+  await (0, import_promises5.mkdir)((0, import_path14.dirname)(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   await writeFile6(tmpPath, data, "utf-8");
   const { rename: rename3 } = await import("fs/promises");
@@ -3045,9 +3155,9 @@ async function readWorkerHeartbeat(teamName, workerName2, cwd) {
 }
 async function readMonitorSnapshot(teamName, cwd) {
   const p = absPath(cwd, TeamPaths.monitorSnapshot(teamName));
-  if (!(0, import_fs10.existsSync)(p)) return null;
+  if (!(0, import_fs11.existsSync)(p)) return null;
   try {
-    const raw = await (0, import_promises4.readFile)(p, "utf-8");
+    const raw = await (0, import_promises5.readFile)(p, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
     const monitorTimings = (() => {
@@ -3096,7 +3206,7 @@ async function readShutdownAck(teamName, workerName2, cwd, requestedAfter) {
 }
 async function listTasksFromFiles(teamName, cwd) {
   const tasksDir = absPath(cwd, TeamPaths.tasks(teamName));
-  if (!(0, import_fs10.existsSync)(tasksDir)) return [];
+  if (!(0, import_fs11.existsSync)(tasksDir)) return [];
   const { readdir: readdir2 } = await import("fs/promises");
   const entries = await readdir2(tasksDir);
   const tasks = [];
@@ -3120,71 +3230,6 @@ async function cleanupTeamState(teamName, cwd) {
   try {
     await rm4(root, { recursive: true, force: true });
   } catch {
-  }
-}
-
-// src/team/events.ts
-var import_crypto = require("crypto");
-var import_path14 = require("path");
-var import_promises5 = require("fs/promises");
-var import_fs11 = require("fs");
-async function appendTeamEvent(teamName, event, cwd) {
-  const full = {
-    event_id: (0, import_crypto.randomUUID)(),
-    team: teamName,
-    created_at: (/* @__PURE__ */ new Date()).toISOString(),
-    ...event
-  };
-  const p = absPath(cwd, TeamPaths.events(teamName));
-  await (0, import_promises5.mkdir)((0, import_path14.dirname)(p), { recursive: true });
-  await (0, import_promises5.appendFile)(p, `${JSON.stringify(full)}
-`, "utf8");
-  return full;
-}
-async function emitMonitorDerivedEvents(teamName, tasks, workers, previousSnapshot, cwd) {
-  if (!previousSnapshot) return;
-  const completedEventTaskIds = { ...previousSnapshot.completedEventTaskIds ?? {} };
-  for (const task of tasks) {
-    const prevStatus = previousSnapshot.taskStatusById?.[task.id];
-    if (!prevStatus || prevStatus === task.status) continue;
-    if (task.status === "completed" && !completedEventTaskIds[task.id]) {
-      await appendTeamEvent(teamName, {
-        type: "task_completed",
-        worker: "leader-fixed",
-        task_id: task.id,
-        reason: `status_transition:${prevStatus}->${task.status}`
-      }, cwd).catch(() => {
-      });
-      completedEventTaskIds[task.id] = true;
-    } else if (task.status === "failed") {
-      await appendTeamEvent(teamName, {
-        type: "task_failed",
-        worker: "leader-fixed",
-        task_id: task.id,
-        reason: `status_transition:${prevStatus}->${task.status}`
-      }, cwd).catch(() => {
-      });
-    }
-  }
-  for (const worker of workers) {
-    const prevAlive = previousSnapshot.workerAliveByName?.[worker.name];
-    const prevState = previousSnapshot.workerStateByName?.[worker.name];
-    if (prevAlive === true && !worker.alive) {
-      await appendTeamEvent(teamName, {
-        type: "worker_stopped",
-        worker: worker.name,
-        reason: "pane_exited"
-      }, cwd).catch(() => {
-      });
-    }
-    if (prevState === "working" && worker.status.state === "idle") {
-      await appendTeamEvent(teamName, {
-        type: "worker_idle",
-        worker: worker.name,
-        reason: `state_transition:${prevState}->${worker.status.state}`
-      }, cwd).catch(() => {
-      });
-    }
   }
 }
 
@@ -4347,6 +4392,7 @@ async function main() {
   }
   if (useV2) {
     process.stderr.write("[runtime-cli] Using runtime v2 (event-driven, no watchdog)\n");
+    let lastLeaderNudgeReason = "";
     while (pollActive) {
       await new Promise((r) => setTimeout(r, pollIntervalMs));
       if (!pollActive) break;
@@ -4371,6 +4417,39 @@ async function main() {
         `[runtime-cli/v2] phase=${snap.phase} pending=${snap.tasks.pending} in_progress=${snap.tasks.in_progress} completed=${snap.tasks.completed} failed=${snap.tasks.failed} dead=${snap.deadWorkers.length} totalMs=${snap.performance.total_ms}
 `
       );
+      const leaderGuidance = deriveTeamLeaderGuidance({
+        tasks: {
+          pending: snap.tasks.pending,
+          blocked: snap.tasks.blocked,
+          inProgress: snap.tasks.in_progress,
+          completed: snap.tasks.completed,
+          failed: snap.tasks.failed
+        },
+        workers: {
+          total: snap.workers.length,
+          alive: snap.workers.filter((worker) => worker.alive).length,
+          idle: snap.workers.filter((worker) => worker.alive && (worker.status.state === "idle" || worker.status.state === "done")).length,
+          nonReporting: snap.nonReportingWorkers.length
+        }
+      });
+      process.stderr.write(
+        `[runtime-cli/v2] leader_next_action=${leaderGuidance.nextAction} reason=${leaderGuidance.reason}
+`
+      );
+      if (leaderGuidance.nextAction === "keep-checking-status") {
+        lastLeaderNudgeReason = "";
+      }
+      if (leaderGuidance.nextAction !== "keep-checking-status" && leaderGuidance.reason !== lastLeaderNudgeReason) {
+        await appendTeamEvent(teamName, {
+          type: "team_leader_nudge",
+          worker: "leader-fixed",
+          reason: leaderGuidance.reason,
+          next_action: leaderGuidance.nextAction,
+          message: leaderGuidance.message
+        }, cwd).catch(() => {
+        });
+        lastLeaderNudgeReason = leaderGuidance.reason;
+      }
       const v2Observed = snap.tasks.pending + snap.tasks.in_progress + snap.tasks.completed + snap.tasks.failed;
       if (v2Observed !== expectedTaskCount) {
         mismatchStreak += 1;
