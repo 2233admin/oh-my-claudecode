@@ -487,7 +487,8 @@ describe('token usage rendering', () => {
     pendingPermission: null,
     thinkingState: null,
     sessionHealth: { durationMinutes: 10, messageCount: 5, health: 'healthy' },
-    lastRequestTokenUsage: { inputTokens: 1250, outputTokens: 340 },
+    lastRequestTokenUsage: { inputTokens: 1250, outputTokens: 340, reasoningTokens: 120 },
+    sessionTotalTokens: 6590,
     omcVersion: '4.5.4',
     updateAvailable: null,
     toolCallCount: 0,
@@ -529,7 +530,7 @@ describe('token usage rendering', () => {
   it('shows last-request token usage when enabled', async () => {
     const result = await render(createTokenContext(), createTokenConfig(true));
 
-    expect(result).toContain('tok:i1.3k/o340');
+    expect(result).toContain('tok:i1.3k/o340 r120 s6.6k');
   });
 
   it('omits last-request token usage when explicitly disabled', async () => {

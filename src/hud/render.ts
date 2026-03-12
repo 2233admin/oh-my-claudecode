@@ -293,7 +293,7 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
   }
 
   if (enabledElements.showTokens === true) {
-    const tokenUsage = renderTokenUsage(context.lastRequestTokenUsage);
+    const tokenUsage = renderTokenUsage(context.lastRequestTokenUsage, context.sessionTotalTokens);
     if (tokenUsage) elements.push(tokenUsage);
   }
 

@@ -103,6 +103,13 @@ export async function parseTranscript(
   const agentMap = new Map<string, ActiveAgent>();
   const backgroundAgentMap: BackgroundAgentMap = new Map();
   const latestTodos: TodoItem[] = [];
+  const sessionTokenTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    seenUsage: false,
+  };
+  let sessionTotalsReliable = false;
+  const observedSessionIds = new Set<string>();
 
   try {
     // Check file size to determine parsing strategy
@@ -123,6 +130,8 @@ export async function parseTranscript(
             result,
             MAX_AGENT_MAP_SIZE,
             backgroundAgentMap,
+            sessionTokenTotals,
+            observedSessionIds,
           );
         } catch {
           // Skip malformed lines
@@ -148,11 +157,15 @@ export async function parseTranscript(
             result,
             MAX_AGENT_MAP_SIZE,
             backgroundAgentMap,
+            sessionTokenTotals,
+            observedSessionIds,
           );
         } catch {
           // Skip malformed lines
         }
       }
+
+      sessionTotalsReliable = observedSessionIds.size <= 1;
     }
   } catch {
     // Return partial results on error
@@ -203,6 +216,9 @@ export async function parseTranscript(
     ...completed.slice(-(10 - running.length)),
   ].slice(0, 10);
   result.todos = latestTodos;
+  if (sessionTotalsReliable && sessionTokenTotals.seenUsage) {
+    result.sessionTotalTokens = sessionTokenTotals.inputTokens + sessionTokenTotals.outputTokens;
+  }
 
   return result;
 }
@@ -317,12 +333,26 @@ function processEntry(
   result: TranscriptData,
   maxAgentMapSize: number = 50,
   backgroundAgentMap?: BackgroundAgentMap,
+  sessionTokenTotals?: {
+    inputTokens: number;
+    outputTokens: number;
+    seenUsage: boolean;
+  },
+  observedSessionIds?: Set<string>,
 ): void {
   const timestamp = entry.timestamp ? new Date(entry.timestamp) : new Date();
+  if (entry.sessionId) {
+    observedSessionIds?.add(entry.sessionId);
+  }
 
   const usage = extractLastRequestTokenUsage(entry.message?.usage);
   if (usage) {
     result.lastRequestTokenUsage = usage;
+    if (sessionTokenTotals) {
+      sessionTokenTotals.inputTokens += usage.inputTokens;
+      sessionTokenTotals.outputTokens += usage.outputTokens;
+      sessionTokenTotals.seenUsage = true;
+    }
   }
 
   // Set session start time from first entry
@@ -484,9 +514,19 @@ interface TranscriptUsage {
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  reasoning_tokens?: number;
+  output_tokens_details?: {
+    reasoning_tokens?: number;
+    reasoningTokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    reasoningTokens?: number;
+  };
 }
 
 interface TranscriptEntry {
+  sessionId?: string;
   timestamp?: string;
   message?: {
     content?: ContentBlock[];
@@ -527,17 +567,34 @@ interface SkillInput {
 function extractLastRequestTokenUsage(usage: TranscriptUsage | undefined): LastRequestTokenUsage | null {
   if (!usage) return null;
 
-  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : null;
-  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : null;
+  const inputTokens = getNumericUsageValue(usage.input_tokens);
+  const outputTokens = getNumericUsageValue(usage.output_tokens);
+  const reasoningTokens = getNumericUsageValue(
+    usage.reasoning_tokens
+      ?? usage.output_tokens_details?.reasoning_tokens
+      ?? usage.output_tokens_details?.reasoningTokens
+      ?? usage.completion_tokens_details?.reasoning_tokens
+      ?? usage.completion_tokens_details?.reasoningTokens,
+  );
 
   if (inputTokens == null && outputTokens == null) {
     return null;
   }
 
-  return {
+  const normalized: LastRequestTokenUsage = {
     inputTokens: Math.max(0, Math.round(inputTokens ?? 0)),
     outputTokens: Math.max(0, Math.round(outputTokens ?? 0)),
   };
+
+  if (reasoningTokens != null && reasoningTokens > 0) {
+    normalized.reasoningTokens = Math.max(0, Math.round(reasoningTokens));
+  }
+
+  return normalized;
+}
+
+function getNumericUsageValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 // ============================================================================

@@ -723,23 +723,25 @@ Configure HUD elements in `~/.claude/settings.json`:
     "elements": {
       "cwd": true,
       "gitRepo": true,
-      "gitBranch": true
+      "gitBranch": true,
+      "showTokens": true
     }
   }
 }
 ```
 
-| Element      | Description                    | Default |
-| ------------ | ------------------------------ | ------- |
-| `cwd`        | Show current working directory | `false` |
-| `gitRepo`    | Show git repository name       | `false` |
-| `gitBranch`  | Show current git branch        | `false` |
-| `omcLabel`   | Show [OMC] label               | `true`  |
-| `contextBar` | Show context window usage      | `true`  |
-| `agents`     | Show active agents count       | `true`  |
-| `todos`      | Show todo progress             | `true`  |
-| `ralph`      | Show ralph loop status         | `true`  |
-| `autopilot`  | Show autopilot status          | `true`  |
+| Element      | Description                                                                                       | Default |
+| ------------ | ------------------------------------------------------------------------------------------------- | ------- |
+| `cwd`        | Show current working directory                                                                    | `false` |
+| `gitRepo`    | Show git repository name                                                                          | `false` |
+| `gitBranch`  | Show current git branch                                                                           | `false` |
+| `omcLabel`   | Show [OMC] label                                                                                  | `true`  |
+| `contextBar` | Show context window usage                                                                         | `true`  |
+| `agents`     | Show active agents count                                                                          | `true`  |
+| `todos`      | Show todo progress                                                                                | `true`  |
+| `ralph`      | Show ralph loop status                                                                            | `true`  |
+| `autopilot`  | Show autopilot status                                                                             | `true`  |
+| `showTokens` | Show transcript-derived token usage (`tok:i1.2k/o340`, plus `r...` reasoning and `s...` session total when reliable) | `false` |
 
 Additional `omcHud` layout options (top-level):
 

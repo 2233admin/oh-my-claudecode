@@ -113,6 +113,7 @@ export interface SessionHealth {
 export interface LastRequestTokenUsage {
   inputTokens: number;
   outputTokens: number;
+  reasoningTokens?: number;
 }
 
 export interface TranscriptData {
@@ -123,6 +124,7 @@ export interface TranscriptData {
   pendingPermission?: PendingPermission;
   thinkingState?: ThinkingState;
   lastRequestTokenUsage?: LastRequestTokenUsage;
+  sessionTotalTokens?: number;
   toolCallCount: number;
   agentCallCount: number;
   skillCallCount: number;
@@ -330,6 +332,9 @@ export interface HudRenderContext {
   /** Last-request token usage parsed from transcript message.usage */
   lastRequestTokenUsage?: LastRequestTokenUsage | null;
 
+  /** Session token total (input + output) when transcript parsing is reliable enough to calculate it */
+  sessionTotalTokens?: number | null;
+
   /** Installed OMC version (e.g. "4.1.10") */
   omcVersion: string | null;
 
@@ -506,6 +511,7 @@ export const DEFAULT_HUD_CONFIG: HudConfig = {
     missionBoard: false,  // Opt-in mission board for whole-run progress tracking
     promptTime: true,  // Show last prompt time by default
     sessionHealth: true,
+    showTokens: false,
     useBars: false,  // Disabled by default for backwards compatibility
     showCallCounts: true,  // Show tool/agent/skill call counts by default (Issue #710)
     maxOutputLines: 4,
@@ -557,6 +563,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     missionBoard: false,
     promptTime: false,
     sessionHealth: false,
+    showTokens: false,
     useBars: false,
     showCallCounts: false,
     maxOutputLines: 2,
@@ -591,6 +598,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     missionBoard: false,
     promptTime: true,
     sessionHealth: true,
+    showTokens: false,
     useBars: true,
     showCallCounts: true,
     maxOutputLines: 4,
@@ -625,6 +633,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     missionBoard: false,
     promptTime: true,
     sessionHealth: true,
+    showTokens: false,
     useBars: true,
     showCallCounts: true,
     maxOutputLines: 12,
@@ -659,6 +668,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     missionBoard: false,
     promptTime: true,
     sessionHealth: true,
+    showTokens: false,
     useBars: false,
     showCallCounts: true,
     maxOutputLines: 4,
@@ -693,6 +703,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     missionBoard: false,
     promptTime: true,
     sessionHealth: true,
+    showTokens: false,
     useBars: true,
     showCallCounts: true,
     maxOutputLines: 6,
