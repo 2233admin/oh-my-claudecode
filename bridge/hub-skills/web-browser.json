@@ -1,0 +1,19 @@
+{
+  "description": "Browser automation — navigate pages, take screenshots, click elements, fill forms",
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "includeTools": [
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
+        "browser_tab_list",
+        "browser_tab_new",
+        "browser_close"
+      ]
+    }
+  }
+}

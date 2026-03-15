@@ -1,0 +1,9 @@
+{
+  "description": "Anti-detection web scraping — bypass Cloudflare, extract structured data",
+  "mcpServers": {
+    "scrapling": {
+      "command": "scrapling",
+      "args": ["mcp"]
+    }
+  }
+}

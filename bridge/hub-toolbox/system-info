@@ -1,0 +1,15 @@
+#!/bin/bash
+# Example toolbox script: system resource overview
+if [ "$TOOLBOX_ACTION" = "describe" ]; then
+  echo 'name: system-info'
+  echo 'description: Show system resource overview (OS, CPU, memory, disk)'
+else
+  echo "=== OS ==="
+  uname -a 2>/dev/null || echo "Unknown"
+  echo ""
+  echo "=== Uptime ==="
+  uptime 2>/dev/null || echo "Unknown"
+  echo ""
+  echo "=== Disk ==="
+  df -h / 2>/dev/null || echo "Unknown"
+fi

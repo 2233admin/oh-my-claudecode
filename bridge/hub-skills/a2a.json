@@ -1,0 +1,13 @@
+{
+  "description": "A2A multi-agent orchestration — route tasks to Claude/Codex/Gemini/Chinese agents, consensus verification",
+  "mcpServers": {
+    "a2a-gateway": {
+      "command": "python",
+      "args": ["-m", "src.mcp_gateway"],
+      "env": {
+        "PYTHONPATH": "${A2A_DEV_PATH:-./a2a-dev}"
+      },
+      "includeTools": ["list_agents", "ask_agent", "route_task", "consensus_task"]
+    }
+  }
+}
