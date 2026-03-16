@@ -6,6 +6,7 @@ pipeline: [deep-interview, omc-plan, autopilot]
 next-skill: omc-plan
 next-skill-args: --consensus --direct
 handoff: .omc/specs/deep-interview-{slug}.md
+level: 3
 ---
 
 <Purpose>
