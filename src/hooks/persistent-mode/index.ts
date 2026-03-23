@@ -49,6 +49,7 @@ import {
 import { checkAutopilot } from '../autopilot/enforcement.js';
 import { readTeamPipelineState } from '../team-pipeline/state.js';
 import type { TeamPipelinePhase } from '../team-pipeline/types.js';
+import { getActiveAgentCount } from '../subagent-tracker/index.js';
 
 export interface ToolErrorState {
   tool_name: string;
@@ -897,6 +898,18 @@ async function checkRalplan(
       shouldBlock: false,
       message: '',
       mode: 'ralplan'
+    };
+  }
+
+  // Orchestrators are allowed to go idle while delegated work is still active.
+  // Delegation waits are expected, so clear any accumulated breaker budget and
+  // let enforcement resume from a clean slate after the running subagents finish.
+  if (getActiveAgentCount(workingDir) > 0) {
+    writeStopBreaker(workingDir, 'ralplan', 0, sessionId);
+    return {
+      shouldBlock: false,
+      message: '',
+      mode: 'ralplan',
     };
   }
 
