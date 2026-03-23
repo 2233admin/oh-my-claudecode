@@ -122,11 +122,19 @@ preserve their state (e.g. autopilot preserves resume data).
 # Fallback: direct file removal when state_clear MCP tool is unavailable
 SESSION_ID="${CLAUDE_SESSION_ID:-${CLAUDECODE_SESSION_ID:-}}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { d="$PWD"; while [ "$d" != "/" ] && [ ! -d "$d/.omc" ]; do d="$(dirname "$d")"; done; echo "$d"; })"
-if [ "$REPO_ROOT" = "/" ] || [ ! -d "$REPO_ROOT/.omc" ]; then
+
+# Resolve state directory (supports OMC_STATE_DIR centralized storage)
+if [ -n "${OMC_STATE_DIR:-}" ]; then
+  # Find the project state dir by matching the current repo's directory name
+  DIR_NAME="$(basename "$REPO_ROOT")"
+  OMC_STATE="$(find "$OMC_STATE_DIR" -maxdepth 2 -type d -name state -path "*${DIR_NAME}*" 2>/dev/null | head -1)"
+  [ -z "$OMC_STATE" ] && { echo "ERROR: Could not find state dir under OMC_STATE_DIR" >&2; exit 1; }
+elif [ "$REPO_ROOT" != "/" ] && [ -d "$REPO_ROOT/.omc" ]; then
+  OMC_STATE="$REPO_ROOT/.omc/state"
+else
   echo "ERROR: Could not locate .omc state directory" >&2
   exit 1
 fi
-OMC_STATE="$REPO_ROOT/.omc/state"
 MODE="ralplan"  # <-- replace with the target mode
 
 # Clear session-scoped state for the specific mode
