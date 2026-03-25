@@ -1009,41 +1009,58 @@ async function main() {
     // Priority 9: Skill Active State (issue #1033)
     // Skills like code-review, plan, ralplan, tdd, etc. write skill-active-state.json
     // when invoked via the Skill tool. This prevents premature stops mid-skill.
+    //
+    // One-shot skills (ccg, ask, cancel, note, learner, etc.) are stateless and
+    // should never block the stop hook. They complete within the same turn.
     {
+      // One-shot skills that should never block stop
+      const ONESHOT_SKILLS = new Set([
+        "ccg", "ask", "ask-codex", "ask-gemini", "cancel", "note", "learner",
+        "hud", "omc-doctor", "omc-help", "omc-setup", "mcp-setup", "skill",
+        "configure-notifications", "learn-about-omc", "release", "trace",
+        "writer-memory", "ralph-init", "project-session-manager",
+      ]);
+
       const skillState = readStateFileWithSession(stateDir, "skill-active-state.json", sessionId);
       if (skillState.state?.active) {
-        // Staleness check (per-skill TTL)
-        const sLastChecked = skillState.state.last_checked_at ? new Date(skillState.state.last_checked_at).getTime() : 0;
-        const sStartedAt = skillState.state.started_at ? new Date(skillState.state.started_at).getTime() : 0;
-        const sMostRecent = Math.max(sLastChecked, sStartedAt);
-        const sTtl = skillState.state.stale_ttl_ms || 5 * 60 * 1000;
-        const sAge = sMostRecent > 0 ? Date.now() - sMostRecent : Infinity;
-        const isStale = sMostRecent === 0 || sAge > sTtl;
+        const skillName = skillState.state.skill_name || "unknown";
 
-        if (!isStale && isSessionMatch(skillState.state, sessionId)) {
-          const count = skillState.state.reinforcement_count || 0;
-          const maxReinforcements = skillState.state.max_reinforcements || 3;
+        // Skip blocking for one-shot skills — they don't have persistent state
+        if (ONESHOT_SKILLS.has(skillName)) {
+          try { if (skillState.path && existsSync(skillState.path)) unlinkSync(skillState.path); } catch {}
+          // Fall through to allow stop
+        } else {
+          // Staleness check: use started_at ONLY — last_checked_at must not
+          // reset the TTL clock (otherwise the skill never goes stale).
+          const sStartedAt = skillState.state.started_at ? new Date(skillState.state.started_at).getTime() : 0;
+          const sTtl = skillState.state.stale_ttl_ms || 5 * 60 * 1000;
+          const sAge = sStartedAt > 0 ? Date.now() - sStartedAt : Infinity;
+          const isStale = sStartedAt === 0 || sAge > sTtl;
 
-          if (count < maxReinforcements) {
-            if (getActiveSubagentCount(stateDir) > 0) {
-              console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+          if (!isStale && isSessionMatch(skillState.state, sessionId)) {
+            const count = skillState.state.reinforcement_count || 0;
+            const maxReinforcements = skillState.state.max_reinforcements || 3;
+
+            if (count < maxReinforcements) {
+              if (getActiveSubagentCount(stateDir) > 0) {
+                console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+                return;
+              }
+
+              skillState.state.reinforcement_count = count + 1;
+              skillState.state.last_checked_at = new Date().toISOString();
+              writeJsonFile(skillState.path, skillState.state);
+
+              const skillActiveReason = `[SKILL ACTIVE: ${skillName}] The "${skillName}" skill is still executing (reinforcement ${count + 1}/${maxReinforcements}). Continue working on the skill's instructions. Do not stop until the skill completes its workflow.`;
+              console.log(JSON.stringify({
+                decision: "block",
+                reason: skillActiveReason,
+              }));
               return;
+            } else {
+              // Reinforcement limit reached - clear state and allow stop
+              try { if (skillState.path && existsSync(skillState.path)) unlinkSync(skillState.path); } catch {}
             }
-
-            skillState.state.reinforcement_count = count + 1;
-            skillState.state.last_checked_at = new Date().toISOString();
-            writeJsonFile(skillState.path, skillState.state);
-
-            const skillName = skillState.state.skill_name || "unknown";
-            const skillActiveReason = `[SKILL ACTIVE: ${skillName}] The "${skillName}" skill is still executing (reinforcement ${count + 1}/${maxReinforcements}). Continue working on the skill's instructions. Do not stop until the skill completes its workflow.`;
-            console.log(JSON.stringify({
-              decision: "block",
-              reason: skillActiveReason,
-            }));
-            return;
-          } else {
-            // Reinforcement limit reached - clear state and allow stop
-            try { if (skillState.path && existsSync(skillState.path)) unlinkSync(skillState.path); } catch {}
           }
         }
       }
