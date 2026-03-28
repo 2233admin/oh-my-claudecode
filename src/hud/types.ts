@@ -115,6 +115,8 @@ export interface LastRequestTokenUsage {
   inputTokens: number;
   outputTokens: number;
   reasoningTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
 }
 
 export interface TranscriptData {
