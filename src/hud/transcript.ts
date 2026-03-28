@@ -101,6 +101,7 @@ export async function parseTranscript(
     toolCallCount: 0,
     agentCallCount: 0,
     skillCallCount: 0,
+    turnCount: 0,
   };
 
   if (!transcriptPath || !existsSync(transcriptPath)) {
@@ -428,6 +429,7 @@ function processEntry(
   const usage = extractLastRequestTokenUsage(entry.message?.usage);
   if (usage) {
     result.lastRequestTokenUsage = usage;
+    result.turnCount++;
     if (sessionTokenTotals) {
       sessionTokenTotals.inputTokens += usage.inputTokens;
       sessionTokenTotals.outputTokens += usage.outputTokens;

@@ -38,6 +38,7 @@ import { renderCallCounts } from "./elements/call-counts.js";
 import { renderContextLimitWarning } from "./elements/context-warning.js";
 import { renderMissionBoard } from "./mission-board.js";
 import { renderSessionSummary } from "./elements/session-summary.js";
+import { renderTurnCount } from "./elements/turn-count.js";
 
 /**
  * ANSI escape sequence regex (matches SGR and other CSI sequences).
@@ -414,6 +415,11 @@ export async function render(
       context.skillCallCount,
     );
     if (counts) elements.push(counts);
+  }
+
+  if (enabledElements.showTurnCount === true) {
+    const turns = renderTurnCount(context.turnCount);
+    if (turns) elements.push(turns);
   }
 
   // Session summary (AI-generated label)
