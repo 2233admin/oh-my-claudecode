@@ -332,7 +332,7 @@ export async function render(
   }
 
   if (enabledElements.showTokenSpeed === true) {
-    const speed = renderTokenSpeed(context.tokenSpeed);
+    const speed = renderTokenSpeed(context.tokenSpeed ?? null);
     if (speed) elements.push(speed);
   }
 

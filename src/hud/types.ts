@@ -360,7 +360,7 @@ export interface HudRenderContext {
   promptTime: Date | null;
 
   /** Token output speed for the last response (tokens/second), null if unavailable */
-  tokenSpeed: number | null;
+  tokenSpeed?: number | null;
 
   /** API key source: 'project', 'global', or 'env' */
   apiKeySource: ApiKeySource | null;
