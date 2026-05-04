@@ -52,3 +52,16 @@ Bug fixes for session lifecycle, macOS launch path, and team auth, plus reviewer
 ```bash
 npm install -g oh-my-claude-sisyphus@4.13.6
 ```
+
+Or reinstall the plugin:
+```bash
+claude /install-plugin oh-my-claudecode
+```
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.13.5...v4.13.6
+
+## Contributors
+
+Thank you to all contributors who made this release possible!
+
+@devswha @EthanJStark @RobinNorberg @stevenmorrisroe @Yeachan-Heo
