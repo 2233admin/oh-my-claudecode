@@ -114,6 +114,12 @@ export declare function preLaunch(_cwd: string, _sessionId: string): Promise<voi
  */
 export declare function isPrintMode(args: string[]): boolean;
 /**
+ * Detect raw --madmax / --yolo tokens in launch args. Used before
+ * normalizeClaudeLaunchArgs strips them so we can apply OMC-specific
+ * launch contracts (e.g. tmux-mandatory on macOS).
+ */
+export declare function hasMadmaxFlag(args: string[]): boolean;
+/**
  * runClaude: Launch Claude CLI (blocks until exit)
  * Handles 3 scenarios:
  * 1. inside-tmux: Launch claude in current pane
@@ -121,6 +127,12 @@ export declare function isPrintMode(args: string[]): boolean;
  * 3. direct: tmux not available, run claude directly
  *
  * When --print/-p is present, always runs direct to preserve stdout piping.
+ *
+ * On macOS, `--madmax` (and its `--yolo` alias) require tmux: if tmux is not
+ * installed we exit with a brew install hint rather than silently launching
+ * direct. Inside an existing tmux session the current pane is reused. If
+ * tmux is installed but new-session/attach-session fails, we surface the
+ * error instead of silently demoting to direct mode.
  */
 export declare function runClaude(cwd: string, args: string[], sessionId: string): void;
 /**

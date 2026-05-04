@@ -28,6 +28,7 @@ import {
   isNativeWindowsShell,
   wrapWithLoginShell,
   isClaudeAvailable,
+  isTmuxAvailable,
   quoteShellArg,
   tmuxExec,
 } from './tmux-utils.js';
@@ -378,6 +379,36 @@ export function isPrintMode(args: string[]): boolean {
 }
 
 /**
+ * Detect raw --madmax / --yolo tokens in launch args. Used before
+ * normalizeClaudeLaunchArgs strips them so we can apply OMC-specific
+ * launch contracts (e.g. tmux-mandatory on macOS).
+ */
+export function hasMadmaxFlag(args: string[]): boolean {
+  return args.some((arg) => arg === MADMAX_FLAG || arg === YOLO_FLAG);
+}
+
+class MadmaxTmuxRequiredError extends Error {
+  constructor(public readonly reason: 'missing' | 'launch-failed') {
+    super(`madmax requires tmux: ${reason}`);
+    this.name = 'MadmaxTmuxRequiredError';
+  }
+}
+
+function abortMadmaxRequiresTmux(reason: 'missing' | 'launch-failed'): never {
+  if (reason === 'missing') {
+    console.error('[omc] Error: --madmax/--yolo on macOS requires tmux, but tmux is not installed.');
+    console.error('  Install it with: brew install tmux');
+  } else {
+    console.error('[omc] Error: --madmax/--yolo on macOS requires tmux, but launching tmux failed.');
+    console.error('  Verify tmux works: tmux -V && tmux new-session -d -s _omc_probe \\; kill-session -t _omc_probe');
+  }
+  process.exit(1);
+  // process.exit may be intercepted by tests; throwing guarantees the caller
+  // stops and prevents accidental fall-through to a direct claude launch.
+  throw new MadmaxTmuxRequiredError(reason);
+}
+
+/**
  * runClaude: Launch Claude CLI (blocks until exit)
  * Handles 3 scenarios:
  * 1. inside-tmux: Launch claude in current pane
@@ -385,6 +416,12 @@ export function isPrintMode(args: string[]): boolean {
  * 3. direct: tmux not available, run claude directly
  *
  * When --print/-p is present, always runs direct to preserve stdout piping.
+ *
+ * On macOS, `--madmax` (and its `--yolo` alias) require tmux: if tmux is not
+ * installed we exit with a brew install hint rather than silently launching
+ * direct. Inside an existing tmux session the current pane is reused. If
+ * tmux is installed but new-session/attach-session fails, we surface the
+ * error instead of silently demoting to direct mode.
  */
 export function runClaude(cwd: string, args: string[], sessionId: string): void {
   // Print mode must bypass tmux so stdout flows to the parent process (issue #1665)
@@ -393,18 +430,35 @@ export function runClaude(cwd: string, args: string[], sessionId: string): void 
     return;
   }
 
-  const policy = resolveLaunchPolicy(process.env, args);
+  const requireTmux = process.platform === 'darwin' && hasMadmaxFlag(args);
+  try {
+    if (requireTmux && !process.env.TMUX && !isTmuxAvailable()) {
+      abortMadmaxRequiresTmux('missing');
+    }
 
-  switch (policy) {
-    case 'inside-tmux':
-      runClaudeInsideTmux(cwd, args);
-      break;
-    case 'outside-tmux':
-      runClaudeOutsideTmux(cwd, args, sessionId);
-      break;
-    case 'direct':
-      runClaudeDirect(cwd, args);
-      break;
+    const policy = resolveLaunchPolicy(process.env, args, { requireTmux });
+
+    switch (policy) {
+      case 'inside-tmux':
+        runClaudeInsideTmux(cwd, args);
+        break;
+      case 'outside-tmux':
+        runClaudeOutsideTmux(cwd, args, sessionId, { requireTmux });
+        break;
+      case 'direct':
+        if (requireTmux) {
+          abortMadmaxRequiresTmux('missing');
+        }
+        runClaudeDirect(cwd, args);
+        break;
+    }
+  } catch (err) {
+    if (err instanceof MadmaxTmuxRequiredError) {
+      // Already reported via stderr + process.exit(1); swallow so test harnesses
+      // that mock process.exit do not see the synthetic throw escape runClaude.
+      return;
+    }
+    throw err;
   }
 }
 
@@ -467,10 +521,17 @@ export function buildEnvExportPrefix(vars: string[]): string {
 }
 
 /**
- * Run Claude outside tmux - create new session
- * Creates tmux session with Claude
+ * Run Claude outside tmux - create new session.
+ *
+ * `requireTmux=true` (set by --madmax on macOS) turns the tmux launch
+ * failures from silent demotions into hard errors with a remediation hint.
  */
-function runClaudeOutsideTmux(cwd: string, args: string[], _sessionId: string): void {
+function runClaudeOutsideTmux(
+  cwd: string,
+  args: string[],
+  _sessionId: string,
+  options: { requireTmux?: boolean } = {},
+): void {
   const forwardedEnv = Object.fromEntries(
     TMUX_ENV_FORWARD
       .map((name) => [name, process.env[name]] as const)
@@ -497,6 +558,9 @@ function runClaudeOutsideTmux(cwd: string, args: string[], _sessionId: string): 
   try {
     tmuxExec(['new-session', '-d', '-s', sessionName, '-c', cwd, claudeCmd], { stripTmux: true, stdio: 'inherit' });
   } catch {
+    if (options.requireTmux) {
+      abortMadmaxRequiresTmux('launch-failed');
+    }
     runClaudeDirect(cwd, args);
     return;
   }
@@ -517,6 +581,9 @@ function runClaudeOutsideTmux(cwd: string, args: string[], _sessionId: string): 
       tmuxExec(['has-session', '-t', sessionName], { stripTmux: true, stdio: 'ignore' });
       return;
     } catch {
+      if (options.requireTmux) {
+        abortMadmaxRequiresTmux('launch-failed');
+      }
       runClaudeDirect(cwd, args);
     }
   }

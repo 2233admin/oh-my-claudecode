@@ -69,6 +69,23 @@ describe('resolveLaunchPolicy', () => {
         });
         expect(resolveLaunchPolicy({})).toBe('direct');
     });
+    it('returns "outside-tmux" with requireTmux=true even when CMUX_SURFACE_ID is set', () => {
+        mockedExecFileSync.mockReturnValue('tmux 3.6a');
+        expect(resolveLaunchPolicy({ CMUX_SURFACE_ID: 'some-id' }, [], { requireTmux: true })).toBe('outside-tmux');
+    });
+    it('returns "direct" with requireTmux=true when tmux is not available', () => {
+        mockedExecFileSync.mockImplementation(() => {
+            throw new Error('tmux not found');
+        });
+        expect(resolveLaunchPolicy({}, [], { requireTmux: true })).toBe('direct');
+    });
+    it('still respects --print over requireTmux=true', () => {
+        mockedExecFileSync.mockReturnValue('tmux 3.6a');
+        expect(resolveLaunchPolicy({ CMUX_SURFACE_ID: 'some-id' }, ['--print'], { requireTmux: true })).toBe('direct');
+    });
+    it('still respects TMUX env (inside-tmux) over requireTmux=true', () => {
+        expect(resolveLaunchPolicy({ TMUX: '/tmp/tmux-0/default,1,0', CMUX_SURFACE_ID: 'some-id' }, [], { requireTmux: true })).toBe('inside-tmux');
+    });
     it('detects tmux.cmd via COMSPEC on win32', () => {
         const originalPlatform = process.platform;
         Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });

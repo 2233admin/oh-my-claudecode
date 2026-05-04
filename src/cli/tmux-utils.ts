@@ -211,6 +211,15 @@ export function isClaudeAvailable(): boolean {
 }
 
 /**
+ * Options for `resolveLaunchPolicy`. `requireTmux=true` makes
+ * CMUX_SURFACE_ID stop demoting to 'direct'. The caller is responsible for
+ * gating on platform/flag combinations (e.g. macOS + --madmax).
+ */
+export interface ResolveLaunchPolicyOptions {
+  requireTmux?: boolean;
+}
+
+/**
  * Resolve launch policy based on environment and args
  * - inside-tmux: Already in tmux session, split pane for HUD
  * - outside-tmux: Not in tmux, create new session
@@ -220,17 +229,18 @@ export function isClaudeAvailable(): boolean {
 export function resolveLaunchPolicy(
   env: NodeJS.ProcessEnv = process.env,
   args: string[] = [],
+  options: ResolveLaunchPolicyOptions = {},
 ): ClaudeLaunchPolicy {
   if (args.some((arg) => arg === '--print' || arg === '-p')) {
     return 'direct';
   }
   if (env.TMUX) return 'inside-tmux';
   // Terminal emulators that embed their own multiplexer (e.g. cmux, a
-  // Ghostty-based terminal) set CMUX_SURFACE_ID but not TMUX.  tmux
+  // Ghostty-based terminal) set CMUX_SURFACE_ID but not TMUX. tmux
   // attach-session fails in these environments because the host PTY is
   // not directly compatible, leaving orphaned detached sessions.
-  // Fall back to direct mode so Claude launches without tmux wrapping.
-  if (env.CMUX_SURFACE_ID) return 'direct';
+  // Demote to direct unless the caller explicitly requires tmux.
+  if (env.CMUX_SURFACE_ID && !options.requireTmux) return 'direct';
   if (!isTmuxAvailable()) {
     return 'direct';
   }

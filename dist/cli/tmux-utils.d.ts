@@ -53,13 +53,21 @@ export declare function isTmuxAvailable(): boolean;
  */
 export declare function isClaudeAvailable(): boolean;
 /**
+ * Options for `resolveLaunchPolicy`. `requireTmux=true` makes
+ * CMUX_SURFACE_ID stop demoting to 'direct'. The caller is responsible for
+ * gating on platform/flag combinations (e.g. macOS + --madmax).
+ */
+export interface ResolveLaunchPolicyOptions {
+    requireTmux?: boolean;
+}
+/**
  * Resolve launch policy based on environment and args
  * - inside-tmux: Already in tmux session, split pane for HUD
  * - outside-tmux: Not in tmux, create new session
  * - direct: tmux not available, run directly
  * - direct: print mode requested so stdout can flow to parent process
  */
-export declare function resolveLaunchPolicy(env?: NodeJS.ProcessEnv, args?: string[]): ClaudeLaunchPolicy;
+export declare function resolveLaunchPolicy(env?: NodeJS.ProcessEnv, args?: string[], options?: ResolveLaunchPolicyOptions): ClaudeLaunchPolicy;
 /**
  * Build tmux session name from directory, git branch, and UTC timestamp
  * Format: omc-{dir}-{branch}-{utctimestamp}
