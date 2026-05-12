@@ -331,6 +331,16 @@ export interface TeamDispatchRequestInput {
   last_reason?: string;
 }
 
+/** Structured async handoff between external agents and team workers */
+export interface TeamConversationHandoff {
+  from_agent?: string;
+  summary: string;
+  reasoning?: string;
+  actions?: string[];
+  files?: string[];
+  text?: string;
+}
+
 /** Team event emitted by the event bus */
 export interface TeamEvent {
   event_id: string;
@@ -341,6 +351,7 @@ export interface TeamEvent {
     | 'worker_idle'
     | 'worker_stopped'
     | 'message_received'
+    | 'conversation_handoff'
     | 'shutdown_ack'
     | 'shutdown_gate'
     | 'shutdown_gate_forced'

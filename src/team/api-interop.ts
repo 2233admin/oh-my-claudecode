@@ -30,6 +30,7 @@ import {
   teamReadWorkerHeartbeat,
   teamUpdateWorkerHeartbeat,
   teamWriteWorkerInbox,
+  teamAppendWorkerInbox,
   teamWriteWorkerIdentity,
   teamAppendEvent,
   teamGetSummary,
@@ -42,6 +43,7 @@ import {
   teamWriteTaskApproval,
   type TeamMonitorSnapshotState,
 } from './team-ops.js';
+import type { TeamConversationHandoff } from './types.js';
 import { queueBroadcastMailboxMessage, queueDirectMailboxMessage, type DispatchOutcome } from './mcp-comm.js';
 import { injectToLeaderPane, sendToWorker } from './tmux-session.js';
 import { listDispatchRequests, markDispatchRequestDelivered, markDispatchRequestNotified } from './dispatch-queue.js';
@@ -103,6 +105,7 @@ export const TEAM_API_OPERATIONS = [
   'read-worker-heartbeat',
   'update-worker-heartbeat',
   'write-worker-inbox',
+  'handoff-message',
   'write-worker-identity',
   'append-event',
   'get-summary',
@@ -142,6 +145,64 @@ function parseValidatedTaskIdArray(value: unknown, fieldName: string): string[] 
     taskIds.push(normalized);
   }
   return taskIds;
+}
+
+function parseOptionalStringArray(value: unknown, fieldName: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array of strings`);
+  }
+
+  return value.map((item) => {
+    if (typeof item !== 'string') {
+      throw new Error(`${fieldName} entries must be strings`);
+    }
+    const normalized = item.trim();
+    if (!normalized) {
+      throw new Error(`${fieldName} entries must not be empty`);
+    }
+    return normalized;
+  });
+}
+
+function formatConversationHandoff(handoff: TeamConversationHandoff): string {
+  const lines: string[] = [];
+  const fromAgent = handoff.from_agent?.trim() || 'external-agent';
+
+  lines.push(`# Conversation Handoff`);
+  lines.push('');
+  lines.push(`From: ${fromAgent}`);
+  lines.push(`Summary: ${handoff.summary}`);
+
+  if (handoff.reasoning) {
+    lines.push('');
+    lines.push('## Reasoning');
+    lines.push(handoff.reasoning);
+  }
+
+  if (handoff.actions && handoff.actions.length > 0) {
+    lines.push('');
+    lines.push('## Actions');
+    for (const action of handoff.actions) {
+      lines.push(`- ${action}`);
+    }
+  }
+
+  if (handoff.files && handoff.files.length > 0) {
+    lines.push('');
+    lines.push('## Files');
+    for (const file of handoff.files) {
+      lines.push(`- ${file}`);
+    }
+  }
+
+  if (handoff.text) {
+    lines.push('');
+    lines.push('## Context');
+    lines.push(handoff.text);
+  }
+
+  return lines.join('\n');
 }
 
 function teamStateExists(teamName: string, candidateCwd: string): boolean {
@@ -791,6 +852,41 @@ export async function executeTeamApiOperation(
         }
         await teamWriteWorkerInbox(teamName, worker, content, cwd);
         return { ok: true, operation, data: { worker } };
+      }
+      case 'handoff-message': {
+        const teamName = String(args.team_name || '').trim();
+        const worker = String(args.worker || '').trim();
+        const summary = String(args.summary || '').trim();
+        if (!teamName || !worker || !summary) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, worker, summary are required' } };
+        }
+
+        let actions: string[] | undefined;
+        let files: string[] | undefined;
+        try {
+          actions = parseOptionalStringArray(args.actions, 'actions');
+          files = parseOptionalStringArray(args.files, 'files');
+        } catch (error) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: (error as Error).message } };
+        }
+
+        const handoff: TeamConversationHandoff = {
+          from_agent: typeof args.from_agent === 'string' ? args.from_agent.trim() || undefined : undefined,
+          summary,
+          reasoning: typeof args.reasoning === 'string' ? args.reasoning.trim() || undefined : undefined,
+          actions,
+          files,
+          text: typeof args.text === 'string' ? args.text.trim() || undefined : undefined,
+        };
+
+        await teamAppendWorkerInbox(teamName, worker, formatConversationHandoff(handoff), cwd);
+        const event = await teamAppendEvent(teamName, {
+          type: 'conversation_handoff',
+          worker,
+          reason: handoff.from_agent,
+          message: handoff.summary,
+        }, cwd);
+        return { ok: true, operation, data: { worker, handoff, event } };
       }
       case 'write-worker-identity': {
         const teamName = String(args.team_name || '').trim();

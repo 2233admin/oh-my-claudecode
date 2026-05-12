@@ -303,6 +303,20 @@ export async function teamWriteWorkerInbox(
   await writeAtomic(p, prompt);
 }
 
+export async function teamAppendWorkerInbox(
+  teamName: string,
+  workerName: string,
+  content: string,
+  cwd: string,
+): Promise<void> {
+  const p = absPath(cwd, TeamPaths.inbox(teamName, workerName));
+  const existing = existsSync(p) ? await readFile(p, 'utf8') : '';
+  const nextContent = existing.trim().length > 0
+    ? `${existing.replace(/\s+$/, '')}\n\n---\n\n${content}`
+    : content;
+  await writeAtomic(p, nextContent);
+}
+
 // ---------------------------------------------------------------------------
 // Task operations
 // ---------------------------------------------------------------------------

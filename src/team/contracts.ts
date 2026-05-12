@@ -28,6 +28,7 @@ export const TEAM_EVENT_TYPES = [
   'worker_idle',
   'worker_stopped',
   'message_received',
+  'conversation_handoff',
   'shutdown_ack',
   'shutdown_gate',
   'shutdown_gate_forced',

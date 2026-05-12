@@ -73,6 +73,7 @@ const TEAM_API_OPERATION_REQUIRED_FIELDS: Record<TeamApiOperation, string[]> = {
   'read-worker-heartbeat': ['team_name', 'worker'],
   'update-worker-heartbeat': ['team_name', 'worker', 'pid', 'turn_count', 'alive'],
   'write-worker-inbox': ['team_name', 'worker', 'content'],
+  'handoff-message': ['team_name', 'worker', 'summary'],
   'write-worker-identity': ['team_name', 'worker', 'index', 'role'],
   'append-event': ['team_name', 'type', 'worker'],
   'get-summary': ['team_name'],
@@ -91,6 +92,7 @@ const TEAM_API_OPERATION_OPTIONAL_FIELDS: Partial<Record<TeamApiOperation, strin
   'update-task': ['subject', 'description', 'blocked_by', 'requires_code_change'],
   'claim-task': ['expected_version'],
   'read-shutdown-ack': ['min_updated_at'],
+  'handoff-message': ['from_agent', 'reasoning', 'actions', 'files', 'text'],
   'write-worker-identity': [
     'assigned_tasks', 'pid', 'pane_id', 'working_dir',
     'worktree_path', 'worktree_branch', 'worktree_detached', 'team_state_root',
@@ -103,6 +105,7 @@ const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
   'update-task': 'Only non-lifecycle task metadata can be updated.',
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
+  'handoff-message': 'Appends a structured async handoff to a worker inbox and records a conversation_handoff event.',
 };
 
 // ---------------------------------------------------------------------------
